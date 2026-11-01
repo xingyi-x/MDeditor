@@ -1,0 +1,224 @@
+/* ══════════════ 文档渲染样式（全部由 CSS 变量驱动，主题可覆盖） ══════════════ */
+
+/* 注意：默认值统一由 theme.js 的 DOC_DEFAULTS 写到外层 #preview-stage 上再继承进来。
+   ⚠️ 不要在 .markdown-body 上重复声明 --doc-* 变量：元素自身的声明会盖掉继承值，
+      导致排版面板 / 主题的所有设置全部失效（历史 bug）。 */
+.markdown-body {
+  background: var(--doc-bg);
+  color: var(--doc-fg);
+  font-family: var(--doc-font-body);
+  font-size: var(--doc-font-size);
+  line-height: var(--doc-line-height);
+  max-width: var(--doc-max-width);
+  padding: var(--doc-padding);
+  margin: 0 auto;
+  border-radius: var(--doc-radius);
+  box-shadow: var(--doc-shadow);
+  text-align: var(--doc-align);
+  word-wrap: break-word;
+  min-height: 200px;
+}
+
+/* 纸张模式：#preview-stage 带有 .paper 类时，文档呈现为一张“纸” */
+#preview-stage.paper { background: transparent; }
+/* 纸张比面板宽时必须左对齐：居中会让左侧溢出到滚动区外，永远看不到左半页 */
+#preview-stage.paper { justify-content: flex-start; }
+#preview-stage.paper .markdown-body {
+  width: var(--doc-page-width);
+  max-width: var(--doc-page-width);
+  min-height: calc(var(--doc-page-height) - var(--doc-page-margin));
+  box-shadow: 0 2px 14px rgba(0, 0, 0, 0.16), 0 0 1px rgba(0, 0, 0, 0.2);
+  border-radius: 2px;
+  /* 保持真实纸张尺寸：面板变窄时横向滚动，而不是把纸压扁 */
+  flex: 0 0 auto;
+}
+
+/* ── 标题 ── */
+.markdown-body h1, .markdown-body h2, .markdown-body h3,
+.markdown-body h4, .markdown-body h5, .markdown-body h6 {
+  font-family: var(--doc-font-heading);
+  color: var(--doc-heading);
+  font-weight: 600;
+  line-height: 1.35;
+  margin: var(--doc-heading-gap-top) 0 0.7em;
+  text-align: left;
+}
+.markdown-body h1 { font-size: var(--doc-h1-size); }
+.markdown-body h2 { font-size: var(--doc-h2-size); border-bottom: var(--doc-h2-border); padding-bottom: 0.3em; }
+.markdown-body h3 { font-size: var(--doc-h3-size); }
+.markdown-body h4 { font-size: var(--doc-h4-size); }
+.markdown-body h5 { font-size: 1em; }
+.markdown-body h6 { font-size: 0.94em; color: var(--doc-muted); }
+.markdown-body > :first-child { margin-top: 0 !important; }
+
+/* ── 段落与文本 ── */
+.markdown-body p { margin: 0 0 var(--doc-para-gap); text-indent: var(--doc-indent); }
+.markdown-body a { color: var(--doc-link); text-decoration: none; }
+.markdown-body a:hover { text-decoration: underline; }
+.markdown-body strong { color: var(--doc-strong); font-weight: 600; }
+.markdown-body em { font-style: italic; }
+.markdown-body del { color: var(--doc-muted); }
+.markdown-body mark { background: var(--doc-mark-bg); color: inherit; padding: 0 3px; border-radius: 2px; }
+.markdown-body small { color: var(--doc-muted); }
+.markdown-body sup a, .markdown-body .footnotes { font-size: 0.9em; }
+.markdown-body kbd {
+  font-family: var(--doc-font-mono);
+  font-size: 0.82em;
+  background: var(--doc-code-bg);
+  border: 1px solid var(--doc-code-border);
+  border-bottom-width: 2px;
+  border-radius: 4px;
+  padding: 1px 6px;
+}
+
+/* ── 列表 ── */
+.markdown-body ul, .markdown-body ol { margin: 0 0 var(--doc-para-gap); padding-left: 1.8em; text-indent: 0; }
+.markdown-body li { margin: 0.3em 0; }
+.markdown-body li > p { margin-bottom: 0.4em; }
+.markdown-body li::marker { color: var(--doc-muted); }
+.markdown-body ul.contains-task-list { list-style: none; padding-left: 0.3em; }
+.markdown-body li.task-list-item { padding-left: 0.4em; }
+.markdown-body input[type="checkbox"] { accent-color: var(--doc-link); margin-right: 6px; vertical-align: -2px; }
+
+/* ── 引用 ── */
+.markdown-body blockquote {
+  margin: 0 0 var(--doc-para-gap);
+  padding: 0.6em 1em;
+  border-left: 4px solid var(--doc-quote-bar);
+  background: var(--doc-quote-bg);
+  border-radius: 0 var(--doc-radius) var(--doc-radius) 0;
+  color: inherit;
+  text-indent: 0;
+}
+.markdown-body blockquote p { text-indent: 0; }
+.markdown-body blockquote > :last-child { margin-bottom: 0; }
+
+/* ── 代码 ── */
+.markdown-body code {
+  font-family: var(--doc-font-mono);
+  font-size: 0.88em;
+  background: var(--doc-code-bg);
+  color: var(--doc-code-fg);
+  border: 1px solid var(--doc-code-border);
+  border-radius: 5px;
+  padding: 0.15em 0.4em;
+}
+.markdown-body pre {
+  background: var(--doc-code-bg);
+  border: 1px solid var(--doc-code-border);
+  border-radius: var(--doc-radius);
+  padding: 13px 15px;
+  overflow-x: auto;
+  margin: 0 0 var(--doc-para-gap);
+  line-height: 1.55;
+}
+.markdown-body pre code {
+  background: transparent;
+  border: none;
+  padding: 0;
+  font-size: 0.86em;
+  display: block;
+  white-space: pre;
+}
+.markdown-body .code-lang {
+  display: block;
+  text-align: right;
+  font-family: var(--doc-font-mono);
+  font-size: 11px;
+  color: var(--doc-muted);
+  opacity: 0.7;
+  margin-bottom: -6px;
+  position: relative;
+  top: 4px;
+}
+
+/* ── 表格 ── */
+.markdown-body table {
+  border-collapse: collapse;
+  margin: 0 0 var(--doc-para-gap);
+  width: auto;
+  max-width: 100%;
+  display: block;
+  overflow-x: auto;
+  font-size: 0.94em;
+}
+.markdown-body th, .markdown-body td {
+  border: 1px solid var(--doc-table-border);
+  padding: 7px 13px;
+  text-align: left;
+}
+.markdown-body th { background: var(--doc-table-head-bg); font-weight: 600; color: var(--doc-heading); }
+.markdown-body tbody tr:nth-child(even) { background: var(--doc-table-alt-bg); }
+
+/* ── 其他 ── */
+.markdown-body hr {
+  border: none;
+  border-top: 2px solid var(--doc-hr);
+  margin: 1.8em 0;
+}
+.markdown-body img {
+  max-width: 100%;
+  border-radius: var(--doc-radius);
+  display: block;
+  margin: 0.4em auto var(--doc-para-gap);
+}
+.markdown-body .img-caption { display: block; text-align: center; color: var(--doc-muted); font-size: 0.86em; margin: -0.6em 0 var(--doc-para-gap); }
+
+/* KaTeX */
+.markdown-body .katex-display {
+  margin: 0.4em 0 var(--doc-para-gap);
+  overflow-x: auto;
+  overflow-y: hidden;
+  padding: 4px 0;
+}
+.markdown-body .katex { font-size: 1.06em; }
+.markdown-body .math-error { color: var(--ui-danger); font-family: var(--doc-font-mono); font-size: 0.85em; }
+
+/* Mermaid */
+.markdown-body .mermaid-box { margin: 0 0 var(--doc-para-gap); text-align: center; overflow-x: auto; }
+.markdown-body .mermaid-box svg { max-width: 100%; height: auto; }
+/* 图内标签一律不继承正文排版。
+   mermaid 的 HTML 标签放在 <foreignObject> 里，本质是普通 div/p：
+   正文的 text-indent（仿 Word 主题是 2em）/ 段间距 / 字距会把文字挤出 mermaid 算好的
+   固定宽度框——节点文字被裁半截，边上的「是/否」直接只剩一个空灰框。
+   md.js 已改用 SVG <text> 渲染标签（htmlLabels:false），这里再做一层兜底。 */
+.markdown-body .mermaid-box foreignObject p,
+.markdown-body .mermaid-box foreignObject span,
+.markdown-body .mermaid-box foreignObject div {
+  text-indent: 0;
+  letter-spacing: normal;
+  text-align: center;
+  margin: 0;
+}
+.markdown-body .mermaid-error {
+  font-family: var(--doc-font-mono);
+  font-size: 12px;
+  color: var(--ui-danger);
+  background: var(--doc-code-bg);
+  border: 1px dashed var(--doc-code-border);
+  border-radius: var(--doc-radius);
+  padding: 10px;
+  white-space: pre-wrap;
+  text-align: left;
+}
+
+/* 脚注 */
+.markdown-body .footnotes { border-top: 1px solid var(--doc-hr); margin-top: 2em; padding-top: 0.8em; font-size: 0.9em; color: var(--doc-muted); }
+.markdown-body .footnote-ref { font-size: 0.8em; }
+
+/* pagedjs 分页 */
+#paged-output { width: 100%; display: flex; flex-direction: column; align-items: center; }
+#paged-output .pagedjs_pages { width: auto; }
+#paged-output .pagedjs_page {
+  background: var(--doc-bg, #fff);
+  box-shadow: 0 2px 14px rgba(0, 0, 0, 0.16);
+  margin: 0 0 18px;
+}
+#paged-output .pagedjs_page_content > div > .markdown-body {
+  background: transparent; box-shadow: none; max-width: none; padding: 0; border-radius: 0;
+}
+
+/* 打印 */
+@media print {
+  #paged-output .pagedjs_page { box-shadow: none; margin: 0; }
+}

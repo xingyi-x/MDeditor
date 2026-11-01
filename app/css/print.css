@@ -1,0 +1,59 @@
+/* ══════════════ 打印 / 导出 PDF 样式 ══════════════ */
+
+@media print {
+  /* 只打印预览内容 */
+  body > #topbar, body > #main > #sidebar, body > #main > #sidebar-splitter,
+  body > #main > #workspace > #editor-pane, body > #main > #workspace > #vsplitter,
+  #statusbar, #layout-panel, .modal-mask, #toast, #welcome { display: none !important; }
+
+  html, body { height: auto; overflow: visible; background: #fff !important; }
+
+  #main, #workspace, #preview-pane { display: block !important; height: auto !important; overflow: visible !important; flex: none !important; }
+  #preview-scroll { overflow: visible !important; height: auto !important; }
+  #preview-stage { padding: 0 !important; display: block !important; background: #fff !important; }
+
+  .markdown-body {
+    max-width: none !important;
+    width: auto !important;
+    box-shadow: none !important;
+    border-radius: 0 !important;
+    min-height: 0 !important;
+    background: #fff !important;
+    color: #000 !important;
+    padding: 0 !important;
+  }
+  /* 打印时保持用户选择的主题字体字号，但强制黑字白底 */
+  .markdown-body h1, .markdown-body h2, .markdown-body h3,
+  .markdown-body h4, .markdown-body h5, .markdown-body h6,
+  .markdown-body strong { color: #000 !important; }
+  .markdown-body a { color: #000 !important; text-decoration: underline; }
+
+  /* 暗色主题下这些容器仍吃 --doc-* 深色底，会和强制黑字叠成"黑底黑字"，必须一起重置 */
+  .markdown-body pre, .markdown-body code, .markdown-body blockquote,
+  .markdown-body th, .markdown-body td, .markdown-body mark,
+  .markdown-body kbd, .markdown-body .mermaid-box, .markdown-body .katex-display {
+    background: #fff !important;
+    color: #000 !important;
+    box-shadow: none !important;
+  }
+  .markdown-body pre { border-color: #ccc !important; }
+  .markdown-body blockquote { border-left-color: #999 !important; }
+  .markdown-body th { border-color: #999 !important; }
+
+  /* 屏幕上表格是 display:block + overflow-x:auto（为了横向滚动），打印会裁切 */
+  .markdown-body table {
+    display: table !important;
+    width: 100% !important;
+    overflow: visible !important;
+    font-size: 0.9em;
+  }
+
+  pre, blockquote, table, img, .mermaid-box, .katex-display { break-inside: avoid; page-break-inside: avoid; }
+  h1, h2, h3, h4 { break-after: avoid; page-break-after: avoid; }
+
+  /* 阅读时隐藏交互痕迹 */
+  .CodeMirror { display: none !important; }
+}
+
+/* 页面尺寸与页边距由 theme.js 动态写入 <style id="page-style">：
+   @page { size: A4; margin: 20mm 18mm; } */

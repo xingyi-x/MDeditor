@@ -1,0 +1,137 @@
+# MDeditor
+
+本地 Markdown 阅读与排版编辑器（Windows 桌面应用，Tauri 2 构建）。
+
+**特点：**
+
+- 纯本地运行，无账号、无上传、无遥测
+- 源码 / 分栏 / 预览 / 阅读 四种视图，编辑与预览同步滚动
+- **主题系统**：10 款内置文档主题（清爽白 / 暖黄护眼 / 豆沙绿 / 暗夜黑 / 仿 Word / 论文衬线 / 书卷衬线 / 极简灰 / 蓝图科技 / 樱粉），支持自定义主题编辑器（颜色 + 字体 + 附加 CSS），可导入导出
+- **Word/PDF 式排版**：A4/A5/B5/Letter/16K 纸张、页边距（mm）、行距、段间距、首行缩进、两端对齐、正文/标题/代码字体、标题倍率、内容宽度；纸张模式下文档显示为真实比例的"纸"
+  - 默认按「阅读优先」留白：流式模式四周 56px、A4 页边距 24/20mm，正文宽度 860px
+  - 行距 / 首行缩进 / 对齐方式默认「跟随主题」，换主题即换版式（如「仿 Word」自带 2em 缩进 + 两端对齐）；手动改过之后以手动值为准
+- **分页预览**（paged.js）：按纸张真实分页显示
+- **导出**：PDF（系统打印，样式与预览一致）、自包含 HTML、Word（.doc）、纯文本
+- **渲染能力**：GFM、任务列表（预览中可直接勾选并回写源码）、表格、代码高亮（highlight.js）、数学公式（KaTeX）、Mermaid 图表（懒加载）
+- **文件管理**：文件夹树浏览、最近打开、全局全文搜索、重命名/删除、在资源管理器中显示
+- **拖拽打开**：把文件直接拖到窗口上即可（有「松开即打开」提示层）——  
+  `.md` / `.txt` 直接打开，PDF / Word / Excel / PPT / HTML 自动转成 Markdown 后打开，图片插入当前文档
+- 图片：粘贴 / 拖入自动保存到文档旁 `assets/` 目录（可改为内嵌 base64）
+- 自动保存、打字机滚动、编辑器字号调节、GBK 编码自动识别
+- 支持 `.md` / `.markdown` 文件关联（安装版会注册关联；也可在「设置 → 文件关联」一键登记，并跳到 Windows 默认应用页确认）
+- **文档转 Markdown**：PDF / Word(docx) / Excel(xlsx) / PPT(pptx) / HTML / RTF / CSV → Markdown，  
+  图形界面与命令行都能用（见下节）
+
+## 文档转 Markdown
+
+把 PDF / Word / Excel / PPT / HTML 等**转成适合 AI 阅读的 Markdown**：保留标题层级、表格、列表、  
+图片引用与代码块，丢掉字体样式噪音，并把 PDF 里被排版切断的行重新接成完整段落。
+
+### 图形界面
+
+- 菜单「文件 → 导入为 Markdown…」（`Ctrl+Alt+O`）
+- 或把 PDF / docx / xlsx / pptx 等文件**直接拖到窗口里**
+
+转换结果写在源文件同目录（同名 `.md`），图片导出到旁边的 `<名称>_assets/`，转换完自动打开。
+
+### 命令行（cmd / PowerShell / 批处理都能调）
+
+程序是 GUI 子系统的 exe（双击不弹黑框），但**从控制台调用时会自动附加到父控制台**，  
+所以 `mdeditor.exe --to-md ...`、`> 文件` 重定向、管道都能正常用。
+
+```bat
+:: 单个文件 → 同目录同名 .md
+mdeditor.exe --to-md 报告.pdf
+
+:: 整个目录批量转（可递归），输出到指定目录
+mdeditor.exe --to-md D:\docs -r -d D:\docs\md
+
+:: 只打印结果、不落盘（可重定向；此模式下不导出图片）
+mdeditor.exe --to-md 论文.docx --stdout > 论文.md
+
+:: 只要纯文本，不要图片和元信息
+mdeditor.exe --to-md 手册.pdf --no-images --quiet
+
+:: 加 YAML 元信息，喂给 AI / RAG 时便于溯源
+mdeditor.exe --to-md 手册.pdf --front-matter -o 手册.md
+```
+
+选项：
+
+| 选项                 | 说明                           |
+| ------------------ | ---------------------------- |
+| `-o <文件>`          | 指定输出 .md 路径（单文件模式）           |
+| `-d <目录>`          | 输出到指定目录（批量默认与源文件同目录）         |
+| `-r`               | 目录模式递归子目录                    |
+| `--force`          | 覆盖已存在的 .md（默认自动改名，不覆盖）       |
+| `--stdout`         | 只打印到标准输出，不写文件（仅单文件，自动关闭图片导出） |
+| `--no-images`      | 不提取图片                        |
+| `--front-matter`   | 开头写入 YAML 元信息（标题 / 来源 / 时间）  |
+| `--quiet`          | 静默，只输出生成的文件路径（便于脚本取用）        |
+| `-h` / `--version` | 帮助 / 版本                      |
+
+支持格式：`pdf` `docx` `doc`（需本机装 Word/WPS，走 COM 转换）`xlsx` `xlsm` `pptx`  
+`html` `htm` `txt` `csv` `tsv` `rtf` `md`
+
+> 扫描版 PDF（图片型）提取不到文字，需先做 OCR。
+
+**随取随用的两种方式：**
+
+1. 用 `dist\mdconv.bat`：`mdconv.bat 报告.pdf` 等价于 `mdeditor.exe --to-md 报告.pdf`。  
+   （若想在任意位置调用，把 `dist` 目录加进系统 PATH。）
+2. 安装版装好后，主程序在 `%LOCALAPPDATA%\MDeditor\MDeditor.exe`，  
+   把它所在目录加进 PATH 后可直接 `mdeditor --to-md 报告.pdf`。
+
+## 目录结构
+
+```
+MDeditor/
+├── app/                 前端（纯 HTML/CSS/JS，无构建步骤）
+│   ├── index.html
+│   ├── css/             app(UI) / doc(渲染) / print(打印) 三层样式
+│   ├── js/              core / fsx / md / editor / theme / panels / actions / app
+│   └── vendor/          全部第三方库本地化（CodeMirror5、marked、DOMPurify、
+│                        highlight.js、KaTeX、Mermaid、paged.js）
+├── src-tauri/           Tauri 2 后端（Rust，自定义文件命令，支持任意路径读写）
+│   └── src/
+│       ├── main.rs       文件读写 / 目录 / 搜索 / 转换命令
+│       ├── cli.rs        命令行模式：--to-md 文档转 Markdown
+│       └── convert/      转换引擎：docx / xlsx / pptx / pdf / html / rtf / plain
+├── dist/               成品：MDeditor.exe（绿色版/命令行入口）、安装包、mdconv.bat
+├── _toolchain/          Rust 工具链（本机自用，gitignore）
+├── build-release.bat    一键构建 release exe
+└── 示例文档.md           功能演示文档
+```
+
+## 构建
+
+环境要求（本机已具备）：Rust stable（MSVC 工具链）、MSVC Build Tools、WebView2 Runtime、Node（可选）。
+
+```bat
+build-release.bat
+```
+
+产物：`src-tauri\target\release\mdeditor.exe`（单文件绿色版，前端资源已内嵌）。
+
+如需安装包（NSIS，含 .md 文件关联与开始菜单快捷方式），安装 tauri-cli 后运行：
+
+```
+cargo install tauri-cli --version ^2
+cargo tauri build
+```
+
+## 快捷键
+
+| 快捷键                            | 功能                      |
+| ------------------------------ | ----------------------- |
+| Ctrl+S / Ctrl+Shift+S          | 保存 / 另存为                |
+| Ctrl+N / Ctrl+O / Ctrl+Shift+O | 新建 / 打开文件 / 打开文件夹       |
+| Ctrl+Alt+O                     | 导入 PDF/Word 等为 Markdown |
+| Ctrl+B / Ctrl+I / Ctrl+K       | 加粗 / 斜体 / 链接            |
+| Ctrl+1..4                      | 一至四级标题                  |
+| Ctrl+F / Ctrl+H                | 编辑器内查找 / 替换             |
+| Alt+1..4                       | 源码 / 分栏 / 预览 / 阅读       |
+| Ctrl+\\                        | 显示/隐藏侧栏                 |
+| Ctrl+P                         | 打印 / 导出 PDF             |
+| Ctrl+= / Ctrl+-                | 编辑器字号                   |
+| F11                            | 全屏                      |

@@ -1,0 +1,239 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-ui="light" data-view="split">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MDeditor</title>
+<link rel="stylesheet" href="vendor/codemirror/codemirror.css">
+<link rel="stylesheet" href="vendor/codemirror/dialog/dialog.css">
+<link rel="stylesheet" href="vendor/hljs/github.min.css" id="hljs-light">
+<link rel="stylesheet" href="vendor/hljs/github-dark.min.css" id="hljs-dark" disabled>
+<link rel="stylesheet" href="vendor/katex/katex.min.css">
+<link rel="stylesheet" href="css/app.css">
+<link rel="stylesheet" href="css/doc.css">
+<link rel="stylesheet" href="css/print.css">
+</head>
+<body>
+
+<!-- ══════════ 顶栏 ══════════ -->
+<header id="topbar">
+  <div class="tb-group">
+    <span id="logo"><svg viewBox="0 0 24 24" width="18" height="18"><rect x="1" y="1" width="22" height="22" rx="5" fill="#4f46e5"/><path d="M5 16.5V7.5l4 5 3-7 3 7 4-5v9" fill="none" stroke="#fff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg><b>MDeditor</b></span>
+  </div>
+
+  <div class="tb-group tb-menus">
+    <div class="menu" data-menu="file">
+      <button class="menu-btn" data-open-menu="file">文件</button>
+      <div class="menu-pop" data-pop="file" hidden>
+        <button data-act="newFile">新建文档 <kbd>Ctrl+N</kbd></button>
+        <button data-act="openFile">打开文件… <kbd>Ctrl+O</kbd></button>
+        <button data-act="openFolder">打开文件夹… <kbd>Ctrl+Shift+O</kbd></button>
+        <button data-act="importDoc">导入为 Markdown… <kbd>Ctrl+Alt+O</kbd></button>
+        <hr>
+        <button data-act="save">保存 <kbd>Ctrl+S</kbd></button>
+        <button data-act="saveAs">另存为… <kbd>Ctrl+Shift+S</kbd></button>
+        <button data-act="revealInExplorer">在资源管理器中显示</button>
+        <hr>
+        <button data-act="closeDoc">关闭当前文档</button>
+      </div>
+    </div>
+    <div class="menu" data-menu="export">
+      <button class="menu-btn" data-open-menu="export">导出</button>
+      <div class="menu-pop" data-pop="export" hidden>
+        <button data-act="exportPDF">导出 PDF（打印）… <kbd>Ctrl+P</kbd></button>
+        <button data-act="exportHTML">导出 HTML（自包含）…</button>
+        <button data-act="exportWord">导出 Word（.doc）…</button>
+        <hr>
+        <button data-act="exportTXT">导出纯文本…</button>
+        <button data-act="exportTheme">导出当前主题（.json）</button>
+      </div>
+    </div>
+    <div class="menu" data-menu="view">
+      <button class="menu-btn" data-open-menu="view">视图</button>
+      <div class="menu-pop" data-pop="view" hidden>
+        <div class="menu-label">布局</div>
+        <button data-act="viewSource">源码模式 <kbd>Alt+1</kbd></button>
+        <button data-act="viewSplit">分栏模式 <kbd>Alt+2</kbd></button>
+        <button data-act="viewPreview">预览模式 <kbd>Alt+3</kbd></button>
+        <button data-act="viewRead">阅读模式 <kbd>Alt+4</kbd></button>
+        <hr>
+        <button data-act="toggleSidebar">显示/隐藏侧栏 <kbd>Ctrl+\</kbd></button>
+        <button data-act="toggleTypewriter">打字机滚动</button>
+        <button data-act="toggleFullscreen">全屏 <kbd>F11</kbd></button>
+      </div>
+    </div>
+  </div>
+
+  <div class="tb-group tb-tools" id="fmt-toolbar">
+    <button data-fmt="bold" title="加粗 (Ctrl+B)"><svg viewBox="0 0 24 24"><path d="M7 4h6.5a4 4 0 0 1 0 8H7zm0 8h7.5a4 4 0 0 1 0 8H7z" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/></svg></button>
+    <button data-fmt="italic" title="斜体 (Ctrl+I)"><svg viewBox="0 0 24 24"><path d="M10 4h9M5 20h9M14.5 4 9.5 20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg></button>
+    <button data-fmt="h" title="标题 (Ctrl+1..3)"><svg viewBox="0 0 24 24"><path d="M4 5v14M13 5v14M4 12h9M17 19v-8m0 0c0-1 .8-2 2.5-2S22 10 22 11m-5 5.5c0 1 .8 1.8 2.5 1.8s2.5-1 2.5-2.3V11" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg></button>
+    <button data-fmt="quote" title="引用 (Ctrl+Shift+Q)"><svg viewBox="0 0 24 24"><path d="M5 16V9a4 4 0 0 1 4-4M14 16V9a4 4 0 0 1 4-4M5 16a3 3 0 1 1-3 3m12-3a3 3 0 1 1-3 3" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg></button>
+    <button data-fmt="ul" title="无序列表"><svg viewBox="0 0 24 24"><path d="M9 6h12M9 12h12M9 18h12" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><circle cx="4.5" cy="6" r="1.6" fill="currentColor"/><circle cx="4.5" cy="12" r="1.6" fill="currentColor"/><circle cx="4.5" cy="18" r="1.6" fill="currentColor"/></svg></button>
+    <button data-fmt="ol" title="有序列表"><svg viewBox="0 0 24 24"><path d="M10 6h11M10 12h11M10 18h11" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><text x="2" y="8" font-size="7" fill="currentColor">1</text><text x="2" y="14" font-size="7" fill="currentColor">2</text><text x="2" y="20" font-size="7" fill="currentColor">3</text></svg></button>
+    <button data-fmt="table" title="插入表格"><svg viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="16" rx="2" fill="none" stroke="currentColor" stroke-width="2"/><path d="M3 9.5h18M3 15h18M9 4v16M15 4v16" stroke="currentColor" stroke-width="1.5"/></svg></button>
+    <button data-fmt="link" title="链接 (Ctrl+K)"><svg viewBox="0 0 24 24"><path d="M10 14a5 5 0 0 0 7.5.5l2-2a5 5 0 0 0-7-7l-1.2 1.2M14 10a5 5 0 0 0-7.5-.5l-2 2a5 5 0 0 0 7 7l1.2-1.2" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg></button>
+    <button data-fmt="image" title="插入图片"><svg viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="16" rx="2" fill="none" stroke="currentColor" stroke-width="2"/><circle cx="9" cy="10" r="1.8" fill="currentColor"/><path d="m5 19 5.5-6 4 4.5L17 15l3 4" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/></svg></button>
+    <button data-fmt="code" title="代码块"><svg viewBox="0 0 24 24"><path d="m8 6-5 6 5 6M16 6l5 6-5 6" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></button>
+    <button data-fmt="task" title="任务列表"><svg viewBox="0 0 24 24"><rect x="3" y="4" width="8" height="8" rx="1.5" fill="none" stroke="currentColor" stroke-width="2"/><path d="m4.8 8 1.6 1.8L9.5 6" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><path d="M14 7h7M14 17h7" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><rect x="3" y="14" width="8" height="8" rx="1.5" fill="none" stroke="currentColor" stroke-width="2"/></svg></button>
+    <button data-fmt="hr" title="分隔线"><svg viewBox="0 0 24 24"><path d="M3 12h18" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><path d="M7 5h10M7 19h10" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" opacity=".4"/></svg></button>
+  </div>
+
+  <div class="tb-spacer"></div>
+
+  <div class="tb-group">
+    <div class="view-switch" id="view-switch">
+      <button data-view-btn="source" title="源码模式">源码</button>
+      <button data-view-btn="split" class="active" title="分栏模式">分栏</button>
+      <button data-view-btn="preview" title="预览模式">预览</button>
+      <button data-view-btn="read" title="阅读模式">阅读</button>
+    </div>
+    <div class="menu" data-menu="theme">
+      <button class="menu-btn" data-open-menu="theme" id="theme-menu-btn">主题</button>
+      <div class="menu-pop" data-pop="theme" id="theme-menu-pop" hidden></div>
+    </div>
+    <button class="tb-btn" id="btn-layout" title="排版设置">排版</button>
+    <button class="tb-btn icon-only" id="btn-settings" title="设置">
+      <svg viewBox="0 0 24 24" width="17" height="17"><path d="M12 15.5A3.5 3.5 0 1 1 12 8.5a3.5 3.5 0 0 1 0 7zm7.4-3.5c0-.6-.1-1.1-.2-1.6l2-1.6-2-3.4-2.4 1a7.6 7.6 0 0 0-2.7-1.6L13.7 2h-3.4l-.4 2.8c-1 .3-1.9.9-2.7 1.6l-2.4-1-2 3.4 2 1.6c-.1.5-.2 1-.2 1.6s.1 1.1.2 1.6l-2 1.6 2 3.4 2.4-1c.8.7 1.7 1.3 2.7 1.6l.4 2.8h3.4l.4-2.8c1-.3 1.9-.9 2.7-1.6l2.4 1 2-3.4-2-1.6c.1-.5.2-1 .2-1.6z" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/></svg>
+    </button>
+  </div>
+</header>
+
+<!-- ══════════ 主区 ══════════ -->
+<div id="main">
+  <aside id="sidebar">
+    <nav class="side-tabs">
+      <button class="active" data-side-tab="files" title="文件">文件</button>
+      <button data-side-tab="outline" title="大纲">大纲</button>
+      <button data-side-tab="search" title="全局搜索">搜索</button>
+    </nav>
+    <div class="side-body" data-side-body="files">
+      <div class="side-actions">
+        <button data-act="openFolder" title="打开文件夹">📂 文件夹</button>
+        <button data-act="newFileInFolder" title="在当前目录新建">＋ 新建</button>
+      </div>
+      <div id="filetree" class="side-list"></div>
+      <div class="side-sub">最近打开</div>
+      <div id="recent-list" class="side-list"></div>
+    </div>
+    <div class="side-body" data-side-body="outline" hidden>
+      <div id="outline" class="side-list"></div>
+    </div>
+    <div class="side-body" data-side-body="search" hidden>
+      <div class="search-box">
+        <input id="gsearch-input" type="text" placeholder="在当前文件夹中搜索…">
+        <label class="chk"><input type="checkbox" id="gsearch-case">区分大小写</label>
+      </div>
+      <div id="gsearch-results" class="side-list"></div>
+    </div>
+  </aside>
+
+  <div id="sidebar-splitter" title="拖动调整宽度"></div>
+
+  <main id="workspace">
+    <section id="editor-pane">
+      <div id="editor"></div>
+    </section>
+    <div id="vsplitter"></div>
+    <section id="preview-pane">
+      <div id="preview-scroll">
+        <div id="preview-stage">
+          <article id="preview" class="markdown-body" hidden></article>
+          <div id="paged-output" hidden></div>
+        </div>
+        <div id="welcome"></div>
+      </div>
+    </section>
+  </main>
+</div>
+
+<!-- ══════════ 状态栏 ══════════ -->
+<footer id="statusbar">
+  <span id="st-save" class="st-item"></span>
+  <span class="st-sep"></span>
+  <span id="st-words" class="st-item">0 字</span>
+  <span id="st-chars" class="st-item">0 字符</span>
+  <span class="st-sep"></span>
+  <span id="st-cursor" class="st-item">行 1，列 1</span>
+  <span class="st-spacer"></span>
+  <span id="st-reading" class="st-item"></span>
+  <span class="st-sep"></span>
+  <span id="st-zoom" class="st-item st-click" title="画面缩放（Ctrl+滚轮调整，点击恢复 100%）">100%</span>
+  <span class="st-sep"></span>
+  <span id="st-theme" class="st-item st-click" title="切换主题">主题</span>
+  <span id="st-path" class="st-item st-path" title=""></span>
+</footer>
+
+<!-- ══════════ 排版面板（右侧抽屉） ══════════ -->
+<aside id="layout-panel" hidden>
+  <header><b>排版设置</b><button class="close" data-close-panel="layout-panel">✕</button></header>
+  <div class="panel-body" id="layout-body"></div>
+</aside>
+
+<!-- ══════════ 设置弹窗 ══════════ -->
+<div class="modal-mask" id="settings-modal" hidden>
+  <div class="modal">
+    <header><b>设置</b><button class="close" data-close-panel="settings-modal">✕</button></header>
+    <div class="modal-body" id="settings-body"></div>
+  </div>
+</div>
+
+<!-- ══════════ 主题编辑器弹窗 ══════════ -->
+<div class="modal-mask" id="theme-modal" hidden>
+  <div class="modal modal-wide">
+    <header><b>主题编辑器</b><button class="close" data-close-panel="theme-modal">✕</button></header>
+    <div class="modal-body" id="theme-body"></div>
+  </div>
+</div>
+
+<!-- ══════════ 快捷键帮助 ══════════ -->
+<div class="modal-mask" id="help-modal" hidden>
+  <div class="modal">
+    <header><b>快捷键</b><button class="close" data-close-panel="help-modal">✕</button></header>
+    <div class="modal-body" id="help-body"></div>
+  </div>
+</div>
+
+<!-- toast -->
+<div id="toast" hidden></div>
+
+<!-- 拖放文件到窗口时的提示层 -->
+<div id="drop-hint" hidden>
+  <div class="drop-hint-inner">
+    <div class="drop-hint-icon">
+      <svg viewBox="0 0 24 24" width="42" height="42"><path d="M12 3v12m0 0 4.5-4.5M12 15l-4.5-4.5M4 17v2.5A1.5 1.5 0 0 0 5.5 21h13a1.5 1.5 0 0 0 1.5-1.5V17" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
+    </div>
+    <div class="drop-hint-title">松开即打开</div>
+    <div class="drop-hint-sub">Markdown / 纯文本直接打开；PDF、Word、Excel、PPT、HTML 会自动转成 Markdown；图片插入到当前文档</div>
+  </div>
+</div>
+
+<script>
+  // pagedjs 关闭自动执行，改为手动触发
+  window.PagedConfig = { auto: false };
+</script>
+<script src="vendor/codemirror/codemirror.js"></script>
+<script src="vendor/codemirror/markdown.js"></script>
+<script src="vendor/codemirror/continuelist.js"></script>
+<script src="vendor/codemirror/closebrackets.js"></script>
+<script src="vendor/codemirror/active-line.js"></script>
+<script src="vendor/codemirror/matchbrackets.js"></script>
+<script src="vendor/codemirror/search/searchcursor.js"></script>
+<script src="vendor/codemirror/search/search.js"></script>
+<script src="vendor/codemirror/match-highlighter.js"></script>
+<script src="vendor/codemirror/dialog/dialog.js"></script>
+<script src="vendor/marked/marked.min.js"></script>
+<script src="vendor/dompurify/purify.min.js"></script>
+<script src="vendor/hljs/highlight.min.js"></script>
+<script src="vendor/katex/katex.min.js"></script>
+<script src="js/core.js"></script>
+<script src="js/fsx.js"></script>
+<script src="js/md.js"></script>
+<script src="js/editor.js"></script>
+<script src="js/theme.js"></script>
+<script src="js/panels.js"></script>
+<script src="js/actions.js"></script>
+<script src="js/zoom.js"></script>
+<script src="js/app.js"></script>
+</body>
+</html>

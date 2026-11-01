@@ -1,0 +1,12 @@
+# 统一换行符：源码按 LF 存储，Windows 脚本保持 CRLF
+* text=auto
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# 二进制资源不做换行转换
+*.png binary
+*.ico binary
+*.icns binary
+*.woff2 binary
+*.exe binary
+*.pdf binary

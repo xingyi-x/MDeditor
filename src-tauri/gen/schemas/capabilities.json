@@ -1,0 +1,1 @@
+{"default":{"identifier":"default","description":"MDeditor 默认权限：窗口基础能力 + 原生对话框（文件读写走自定义 Rust 命令，无作用域限制）","local":true,"windows":["main"],"permissions":["core:default","core:window:allow-set-title","core:webview:allow-print","core:webview:allow-set-webview-zoom","dialog:default"]}}
