@@ -2,6 +2,18 @@
 
 本地 Markdown 阅读与排版编辑器（Windows 桌面应用，Tauri 2 构建）。
 
+## 下载
+
+编译好的二进制文件不纳入版本库，统一通过 [Releases](https://github.com/xingyi-x/MDeditor/releases) 分发：
+
+| 文件 | 说明 |
+| --- | --- |
+| `MDeditor-v1.1-安装包.exe` | **安装版（推荐）**：含 `.md` 文件关联、开始菜单快捷方式，可在「应用和功能」中卸载 |
+| `MDeditor.exe` | **绿色版**：单文件免安装，双击即用（前端资源已内嵌），同时作为命令行入口 |
+| `mdconv.bat` | 命令行转换包装脚本，与 `MDeditor.exe` 放同一目录即可使用 |
+
+环境要求：Windows 10/11 x64 + WebView2 Runtime（Windows 11 已内置；Win10 若缺失需[单独安装](https://developer.microsoft.com/microsoft-edge/webview2/)）。
+
 **特点：**
 
 - 纯本地运行，无账号、无上传、无遥测
@@ -97,9 +109,13 @@ MDeditor/
 │       ├── main.rs       文件读写 / 目录 / 搜索 / 转换命令
 │       ├── cli.rs        命令行模式：--to-md 文档转 Markdown
 │       └── convert/      转换引擎：docx / xlsx / pptx / pdf / html / rtf / plain
-├── dist/               成品：MDeditor.exe（绿色版/命令行入口）、安装包、mdconv.bat
+├── dist/               本地打包输出目录（gitignore，仅 mdconv.bat 入库）
+│   ├── MDeditor.exe              绿色版 / 命令行入口
+│   ├── MDeditor-v1.1-安装包.exe    NSIS 安装包
+│   └── mdconv.bat                命令行包装脚本（入库）
 ├── _toolchain/          Rust 工具链（本机自用，gitignore）
 ├── build-release.bat    一键构建 release exe
+├── LICENSE              MIT
 └── 示例文档.md           功能演示文档
 ```
 
@@ -135,3 +151,10 @@ cargo tauri build
 | Ctrl+P                         | 打印 / 导出 PDF             |
 | Ctrl+= / Ctrl+-                | 编辑器字号                   |
 | F11                            | 全屏                      |
+
+## 许可证
+
+本项目基于 [MIT License](LICENSE) 发布，Copyright (c) 2026 xingyi-x。
+
+`app/vendor/` 下的第三方库（CodeMirror 5、marked、DOMPurify、highlight.js、KaTeX、Mermaid、
+paged.js）各自保留其原始许可证，具体条款见各库文件头注释或上游仓库。
