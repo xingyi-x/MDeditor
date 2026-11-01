@@ -8,9 +8,11 @@
 
 | 文件 | 说明 |
 | --- | --- |
-| `MDeditor-v1.1-安装包.exe` | **安装版（推荐）**：含 `.md` 文件关联、开始菜单快捷方式，可在「应用和功能」中卸载 |
+| `MDeditor-v1.1-setup.exe` | **安装版（推荐）**：含 `.md` 文件关联、开始菜单快捷方式，可在「应用和功能」中卸载 |
 | `MDeditor.exe` | **绿色版**：单文件免安装，双击即用（前端资源已内嵌），同时作为命令行入口 |
 | `mdconv.bat` | 命令行转换包装脚本，与 `MDeditor.exe` 放同一目录即可使用 |
+
+> 本机构建产出的安装包名为 `MDeditor-v1.1-安装包.exe`；上传 Releases 时 GitHub 会剔除文件名中的非 ASCII 字符，故下载名为 `MDeditor-v1.1-setup.exe`，两者内容一致。
 
 环境要求：Windows 10/11 x64 + WebView2 Runtime（Windows 11 已内置；Win10 若缺失需[单独安装](https://developer.microsoft.com/microsoft-edge/webview2/)）。
 
