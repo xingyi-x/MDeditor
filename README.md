@@ -159,7 +159,7 @@ cargo tauri build
 | Ctrl+F / Ctrl+H                | 编辑器内查找 / 替换             |
 | Alt+1..4                       | 源码 / 分栏 / 预览 / 阅读       |
 | Ctrl+\\                        | 显示/隐藏侧栏                 |
-| Ctrl+P                         | 打印 / 导出 PDF             |
+| Ctrl+P                         | 导出 PDF（无页眉页脚，直接落盘）      |
 | Ctrl+= / Ctrl+-                | 编辑器字号                   |
 | F11                            | 全屏                      |
 
