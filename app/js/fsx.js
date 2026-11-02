@@ -57,6 +57,8 @@
       try { await invoke('print_current_window', {}); }
       catch (e) { console.warn(e); window.print(); }
     },
+    /** 直接写 PDF 文件（WebView2 PrintToPdf，无页眉页脚） */
+    async exportPdf(path, opts) { return invoke('export_pdf', { path, opts }); },
     async pickFile(filters, defaultPath) {
       const opt = { multiple: false, filters: filters || [] };
       if (defaultPath) opt.defaultPath = defaultPath;
@@ -85,6 +87,13 @@
     },
     async startupFile() {
       try { return await invoke('get_startup_file', {}); } catch (e) { return null; }
+    },
+    /** --pdf-out 目标路径（自动化导出用，普通启动为 null） */
+    async pdfTarget() {
+      try { return await invoke('get_pdf_target', {}); } catch (e) { return null; }
+    },
+    async quit() {
+      try { await invoke('quit_app', {}); } catch (e) { window.close(); }
     },
     async setWindowTitle(t) {
       try { await invoke('set_window_title', { title: t }); } catch (e) { document.title = t; }
@@ -246,6 +255,7 @@
     async reveal() { MD.toast('浏览器模式不支持该操作'); },
     async openExternal(url) { window.open(url, '_blank'); },
     async print() { window.print(); },
+    async exportPdf() { throw new Error('浏览器模式请用「打印」→ 另存为 PDF'); },
     async pickFile() {
       if (!window.showOpenFilePicker) { MD.toast('当前浏览器不支持文件选择器，请使用拖拽打开'); return null; }
       const [h] = await window.showOpenFilePicker({ types: [{ description: 'Markdown', accept: { 'text/markdown': ['.md', '.markdown'] } }] });
@@ -266,6 +276,8 @@
       return '/';
     },
     async startupFile() { return null; },
+    async pdfTarget() { return null; },
+    async quit() { window.close(); },
     async setWindowTitle(t) { document.title = t; },
     async registerMdAssoc() { throw new Error('仅桌面版支持'); },
     async mdAssocStatus() { return false; },

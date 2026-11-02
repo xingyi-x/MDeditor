@@ -270,6 +270,37 @@
     preview.hidden = MD.editor.value.trim() === '' && !state.currentFile;
   }
 
+  /**
+   * 把 `var(--x)` 递归解析成字面值。
+   * Word 的 HTML 引擎（以及多数"打开 .doc"的软件）不支持 CSS 自定义属性，
+   * 原样导出会让整份文档丢掉字体、字号、行距、对齐等全部版式，
+   * 退回 Word 默认的宋体/Times 12pt。
+   */
+  function flattenVars(css, vars) {
+    const refRe = /var\(\s*(--[\w-]+)\s*(?:,\s*([^()]*))?\)/g;
+    const flat = Object.assign({}, vars);
+    for (let round = 0; round < 4; round++) {
+      let changed = false;
+      for (const k of Object.keys(flat)) {
+        const v = String(flat[k] == null ? '' : flat[k]);
+        const nv = v.replace(refRe, (m, n, fb) => (flat[n] != null ? String(flat[n]) : (fb || '')));
+        if (nv !== v) { flat[k] = nv; changed = true; }
+      }
+      if (!changed) break;
+    }
+    return css.replace(refRe, (m, n, fb) => (flat[n] != null ? String(flat[n]) : (fb || '')));
+  }
+
+  /** Word 只认 `@page WordSection1` 这一套页面设置 */
+  function wordPageCss() {
+    const s = MD.settings;
+    const paperKey = PAPER_MM[s.paper] ? s.paper : 'A4';
+    const [wmm, hmm] = PAPER_MM[paperKey];
+    const m = s.margins || { top: 20, right: 18, bottom: 20, left: 18 };
+    return `@page WordSection1 { size: ${wmm}mm ${hmm}mm; margin: ${m.top}mm ${m.right}mm ${m.bottom}mm ${m.left}mm; }
+div.WordSection1 { page: WordSection1; }`;
+  }
+
   async function buildStandaloneHTML(wordMode) {
     const preview = U.$('#preview');
     const { vars, extraCSS, name, pageCss, paper } = MD.theme.resolvedVars();
@@ -278,6 +309,27 @@
     const now = new Date().toLocaleString('zh-CN');
     const docCss = MD.__docCssText || await getDocCssText();
     const { hljs, katex } = await getExportCss();
+    const title = U.baseName(state.currentFile || '文档').replace(/\.[^.]+$/, '');
+
+    let css = `${wordMode ? '' : `:root { ${varCss} }
+`}${docCss}
+${hljs}
+${katex}
+${extraCSS}
+body { margin: 0; background: var(--doc-bg); color: var(--doc-fg); }
+/* 版式完全交给 --doc-* 变量，这里不再硬编码宽度和内边距 */
+.markdown-body { margin: 0 auto; box-shadow: none; ${paper !== 'flow' ? 'width: var(--doc-page-width);' : ''} }
+${wordMode ? wordPageCss() : pageCss}
+@media print {
+  .markdown-body { max-width: none; padding: 0; }
+  .markdown-body pre, .markdown-body code, .markdown-body blockquote,
+  .markdown-body th, .markdown-body td, .markdown-body mark {
+    background: #fff !important; color: #000 !important;
+  }
+}`;
+    // Word 模式：变量全部拍平成字面值，否则版式全丢
+    if (wordMode) css = flattenVars(css, vars);
+
     return `<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
@@ -285,29 +337,14 @@
 <meta name="author" content="行一">
 <meta name="generator" content="MDeditor">
 <meta name="description" content="由 MDeditor 导出；作者 行一，公众号「每天AI进步」">
-<title>${U.esc(U.baseName(state.currentFile || '文档'))}</title>
+<title>${U.esc(title)}</title>
 ${wordMode ? '<meta name="ProgId" content="Word.Document"><meta name="Generator" content="Microsoft Word">' : ''}
 <style>
-:root { ${varCss} }
-${docCss}
-${hljs}
-${katex}
-${extraCSS}
-body { margin: 0; background: var(--doc-bg); color: var(--doc-fg); }
-/* 版式完全交给 --doc-* 变量，这里不再硬编码宽度和内边距 */
-.markdown-body { margin: 0 auto; box-shadow: none; ${paper !== 'flow' ? 'width: var(--doc-page-width);' : ''} }
-${pageCss}
-@media print {
-  .markdown-body { max-width: none; padding: 0; }
-  .markdown-body pre, .markdown-body code, .markdown-body blockquote,
-  .markdown-body th, .markdown-body td, .markdown-body mark {
-    background: #fff !important; color: #000 !important;
-  }
-}
+${css}
 </style>
 </head>
 <body>
-<article class="markdown-body">${body}</article>
+${wordMode ? '<div class="WordSection1">' : ''}<article class="markdown-body">${body}</article>${wordMode ? '</div>' : ''}
 ${wordMode ? '' : `<div style="text-align:center;color:#9ca3af;font-size:12px;margin:30px 0">${U.esc(name)} · ${U.esc(now)}</div>`}
 </body>
 </html>`;
@@ -331,11 +368,103 @@ ${wordMode ? '' : `<div style="text-align:center;color:#9ca3af;font-size:12px;ma
     await MD.fsx.writeFile(p, html);
     MD.toast('已导出 Word（.doc），可用 Word / WPS 打开');
   }
+  /**
+   * Markdown → 可读纯文本。
+   * 原先直接把 .md 源码原样写进 .txt，用户拿到的是 `## 标题` `**加粗**` `|---|`，
+   * 等于换了扩展名的源码，谈不上"纯文本"。这里按 marked 的 token 流拍平：
+   * 去记号、保留标题/列表/表格/代码块的结构，图片降级为 [图片：alt]。
+   */
+  function toPlainText(md) {
+    const out = [];
+    const blank = () => { if (out.length && out[out.length - 1] !== '') out.push(''); };
+    const inlineText = (toks) => (toks || []).map((t) => {
+      if (!t) return '';
+      if (t.type === 'image') return t.text ? `[图片：${t.text}]` : '[图片]';
+      if (t.type === 'br') return '\n';
+      if (t.type === 'codespan') return t.text || '';
+      if (t.tokens && t.tokens.length) return inlineText(t.tokens);
+      return t.text != null ? t.text : '';
+    }).join('');
+
+    const walkList = (list, depth) => {
+      let n = 0;
+      for (const item of list.items || []) {
+        let head = '';
+        const subs = [];
+        for (const tok of item.tokens || []) {
+          if (tok.type === 'list') { subs.push(tok); continue; }
+          const piece = (tok.type === 'text' || tok.type === 'paragraph')
+            ? inlineText(tok.tokens || [tok])
+            : (tok.text || '');
+          if (piece) head += (head ? ' ' : '') + piece;
+        }
+        n += 1;
+        const mark = list.ordered ? `${(list.start || 1) + n - 1}. ` : '• ';
+        out.push('    '.repeat(depth) + mark + head.trim());
+        for (const s of subs) walkList(s, depth + 1);
+      }
+    };
+
+    const walk = (tokens) => {
+      for (const t of tokens) {
+        switch (t.type) {
+          case 'heading':
+          case 'paragraph':
+            out.push(inlineText(t.tokens));
+            blank();
+            break;
+          case 'text':
+            if (t.tokens) { out.push(inlineText(t.tokens)); blank(); }
+            break;
+          case 'blockquote':
+            walk(t.tokens || []);
+            break;
+          case 'list':
+            walkList(t, 0);
+            blank();
+            break;
+          case 'code':
+            out.push(t.text || '');
+            blank();
+            break;
+          case 'table': {
+            const head = (t.header || []).map((c) => inlineText(c.tokens || [c])).join('\t');
+            if (head) out.push(head);
+            for (const row of t.rows || []) out.push(row.map((c) => inlineText(c.tokens || [c])).join('\t'));
+            blank();
+            break;
+          }
+          case 'hr':
+            out.push('────────────');
+            blank();
+            break;
+          case 'space':
+            blank();
+            break;
+          case 'html':
+            break;
+          default:
+            if (t.text) { out.push(t.text); blank(); }
+        }
+      }
+    };
+
+    try {
+      const lexer = window.marked && window.marked.lexer;
+      if (!lexer) return md;
+      walk(lexer(md));
+    } catch (e) {
+      console.warn('纯文本转换失败，回退为原文', e);
+      return md;
+    }
+    return out.join('\n').replace(/\n{3,}/g, '\n\n').trim() + '\n';
+  }
+
   async function exportTXT() {
     const name = (state.currentFile ? U.baseName(state.currentFile).replace(/\.[^.]+$/, '') : '文档') + '.txt';
     const p = await MD.fsx.pickSaveFile(name, [{ name: '文本文件', extensions: ['txt'] }]);
     if (!p) return;
-    await MD.fsx.writeFile(p, MD.editor.value);
+    await MD.fsx.writeFile(p, toPlainText(MD.editor.value));
     MD.toast('已导出纯文本');
   }
   async function exportTheme() {
@@ -345,6 +474,79 @@ ${wordMode ? '' : `<div style="text-align:center;color:#9ca3af;font-size:12px;ma
     if (!p) return;
     await MD.fsx.writeFile(p, JSON.stringify(t, null, 2));
     MD.toast('主题已导出');
+  }
+
+  /* 纸张规格（mm），与 theme.js 的 PAPERS 保持一致；PDF 导出需要换算成英寸 */
+  const PAPER_MM = {
+    A4: [210, 297], A5: [148, 210], B5: [176, 250], letter: [216, 279], '16k': [184, 260],
+  };
+  const MM_PER_IN = 25.4;
+
+  /** 切到"打印态"：缩放回 100%；分页预览时临时把 @page 页边距归零（版式已烘进页盒） */
+  async function enterPrintState() {
+    const zBefore = MD.zoom ? MD.zoom.get() : 100;
+    if (zBefore !== 100) await MD.zoom.set(100, { silent: true, persist: false });
+    const pageStyle = U.$('#page-style');
+    const pagedOn = !!(pageStyle && MD.settings.pagedPreview && MD.settings.paper !== 'flow');
+    const saved = pageStyle ? pageStyle.textContent : '';
+    if (pagedOn) pageStyle.textContent = '@page { size: auto; margin: 0; }';
+    return () => {
+      if (pagedOn && pageStyle) pageStyle.textContent = saved;
+      if (zBefore !== 100) MD.zoom.set(zBefore, { silent: true, persist: false });
+    };
+  }
+
+  /**
+   * 把当前预览写成 PDF 文件。
+   * 走 WebView2 的 PrintToPdf（Rust 侧 export_pdf），由代码显式关闭
+   * 「页眉 / 页脚」，成品里不会出现日期、文档标题、tauri.localhost 与页码。
+   */
+  async function exportPdfTo(path, opts) {
+    const o = opts || {};
+    const s = MD.settings;
+    const paperKey = PAPER_MM[s.paper] ? s.paper : 'A4';   // 流式模式按 A4 出纸
+    const [wmm, hmm] = PAPER_MM[paperKey];
+    const pagedOn = !!(s.pagedPreview && s.paper !== 'flow');
+    const m = s.margins || { top: 20, right: 18, bottom: 20, left: 18 };
+    // 分页预览时 paged.js 已把页边距做成页面内边距，settings 再给边距会变成双重留白
+    const edge = pagedOn ? { top: 0, right: 0, bottom: 0, left: 0 } : m;
+
+    const restore = await enterPrintState();
+    if (!o.silent) MD.toast('正在生成 PDF…', 8000);
+    try {
+      await MD.fsx.exportPdf(path, {
+        width_in: wmm / MM_PER_IN,
+        height_in: hmm / MM_PER_IN,
+        margin_top_in: (edge.top || 0) / MM_PER_IN,
+        margin_right_in: (edge.right || 0) / MM_PER_IN,
+        margin_bottom_in: (edge.bottom || 0) / MM_PER_IN,
+        margin_left_in: (edge.left || 0) / MM_PER_IN,
+      });
+      if (!o.silent) MD.toast('已导出 PDF：' + U.baseName(path));
+      return true;
+    } catch (e) {
+      MD.toast('PDF 导出失败：' + String((e && e.message) || e), 6000);
+      console.error(e);
+      return false;
+    } finally {
+      restore();
+    }
+  }
+
+  /** 菜单「导出 PDF」：选路径后直接出文件（不经打印对话框） */
+  async function exportPDF() {
+    if (!MD.fsx.isApp) { MD.toast('浏览器模式请用「打印」→ 另存为 PDF'); return; }
+    await ensureRendered();
+    const base = state.currentFile ? U.baseName(state.currentFile).replace(/\.[^.]+$/, '') : '文档';
+    const p = await MD.fsx.pickSaveFile(base + '.pdf', [{ name: 'PDF', extensions: ['pdf'] }]);
+    if (!p) return;
+    await exportPdfTo(p);
+  }
+
+  /** 指定路径导出（--pdf-out 自动化 / 供外部调用） */
+  async function exportPDFTo(path, opts) {
+    await ensureRendered();
+    return exportPdfTo(path, opts);
   }
 
   async function printDoc() {
@@ -429,7 +631,8 @@ ${wordMode ? '' : `<div style="text-align:center;color:#9ca3af;font-size:12px;ma
     newFile, newFileIn: newFile, openFileDialog, openFolderDialog, openFile,
     importFile, importAsMarkdown, isConvertible,
     save, saveAs, closeDoc, closeDocForce, handleImageFile, handleImageDataURL, handleDrop,
-    exportPDF: printDoc, exportHTML, exportWord, exportTXT, exportTheme, printDoc,
+    exportPDF, exportPDFTo, exportPdfTo, printDoc, exportHTML, exportWord, exportTXT, exportTheme,
+    toPlainText, flattenVars,
     buildStandaloneHTML, getDocCssText, renderPaged, clearPagedStyles, ensureRendered,
   };
 

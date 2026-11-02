@@ -1,6 +1,6 @@
 [package]
 name = "mdeditor"
-version = "0.2.0"
+version = "0.3.0"
 description = "本地 Markdown 阅读与排版编辑器"
 authors = ["local"]
 edition = "2021"
@@ -27,6 +27,13 @@ lopdf = "0.34"
 png = "0.17"
 flate2 = "1"
 regex = "1"
+
+# ── PDF 导出：直接调 WebView2 的 PrintToPdf（关掉页眉页脚） ──
+# 版本必须与 tauri/wry 传递依赖一致，否则 ICoreWebView2* 之类的
+# COM 接口类型不互通（cast 会编译失败）
+[target.'cfg(windows)'.dependencies]
+webview2-com = "0.39"
+windows = "0.62"
 
 [profile.release]
 # 不能开 panic = "abort"：pdf-extract 对畸形 PDF 会 panic，

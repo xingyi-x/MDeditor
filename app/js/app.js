@@ -196,6 +196,7 @@
     revealInExplorer: () => state.currentFile ? MD.fsx.reveal(state.currentFile) : MD.toast('请先打开文件'),
     closeDoc: () => MD.actions.closeDoc(),
     exportPDF: () => MD.actions.exportPDF(),
+    printDoc: () => MD.actions.printDoc(),
     exportHTML: () => MD.actions.exportHTML(),
     exportWord: () => MD.actions.exportWord(),
     exportTXT: () => MD.actions.exportTXT(),
@@ -581,7 +582,7 @@
     // 启动文件（文件关联双击打开）
     const startup = await MD.fsx.startupFile();
     if (startup && U.isMarkdown(startup)) {
-      MD.actions.openFile(startup);
+      await MD.actions.openFile(startup);
     } else {
       // 恢复上次文件夹
       if (s.lastFolder) {
@@ -596,6 +597,26 @@
     if (!MD.editor.value.trim()) {
       U.$('#welcome').hidden = false;
       U.$('#preview').hidden = true;
+    }
+
+    // --pdf-out <路径>：渲染完成后直接导出 PDF 并退出（自动化 / 自测用）
+    maybeAutoExportPdf();
+  }
+
+  async function maybeAutoExportPdf() {
+    if (!MD.fsx.isApp) return;
+    let target = null;
+    try { target = await MD.fsx.pdfTarget(); } catch (e) { return; }
+    if (!target) return;
+    try {
+      // 等字体、KaTeX、Mermaid 画完，否则 PDF 里公式是空白
+      await new Promise((r) => setTimeout(r, 900));
+      const ok = await MD.actions.exportPDFTo(target, { silent: true });
+      console.log(ok ? 'pdf-export-ok ' + target : 'pdf-export-failed ' + target);
+    } catch (e) {
+      console.error('自动导出 PDF 失败', e);
+    } finally {
+      setTimeout(() => { MD.fsx.quit(); }, 500);
     }
   }
 

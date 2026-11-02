@@ -3,6 +3,7 @@
 
 mod cli;
 mod convert;
+mod pdfexport;
 
 use base64::Engine as _;
 use serde::Serialize;
@@ -35,6 +36,8 @@ struct SearchHit {
 
 struct AppState {
     startup_file: Mutex<Option<String>>,
+    /// --pdf-out <路径>：启动后自动把当前文档导出成 PDF 再退出（自测 / 批处理用）
+    pdf_out: Mutex<Option<String>>,
 }
 
 fn to_string_err<E: std::fmt::Display>(e: E) -> String {
@@ -435,6 +438,16 @@ fn get_startup_file(state: tauri::State<AppState>) -> Option<String> {
     state.startup_file.lock().unwrap().clone()
 }
 
+#[tauri::command]
+fn get_pdf_target(state: tauri::State<AppState>) -> Option<String> {
+    state.pdf_out.lock().unwrap().clone()
+}
+
+#[tauri::command]
+fn quit_app(app: tauri::AppHandle) {
+    app.exit(0);
+}
+
 // ---------- 命令：文档 → Markdown ----------
 
 #[tauri::command]
@@ -471,10 +484,23 @@ fn convert_supported_exts() -> Vec<String> {
 
 // ---------- 命令：窗口打印导出 PDF ----------
 
+/// 走系统打印对话框（真实打印机 / 用户自选 PDF）。导出的成品 PDF 请用 `export_pdf`。
 #[tauri::command]
 fn print_current_window(window: tauri::WebviewWindow) -> Result<(), String> {
     window.print().map_err(to_string_err)
 }
+
+/// 直接生成 PDF 文件：无打印对话框、无浏览器页眉页脚。
+#[tauri::command]
+async fn export_pdf(
+    window: tauri::WebviewWindow,
+    path: String,
+    opts: pdfexport::PdfOptions,
+) -> Result<String, String> {
+    pdfexport::export(&window, path.clone(), opts).await?;
+    Ok(path)
+}
+
 
 #[tauri::command]
 fn set_window_title(window: tauri::WebviewWindow, title: String) -> Result<(), String> {
@@ -727,10 +753,21 @@ fn main() {
         .find(|a| !a.starts_with('-') && Path::new(a).is_file())
         .cloned();
 
+    // --pdf-out <路径> 或 --pdf-out=<路径>：无界面交互地把文档导出成 PDF
+    let pdf_out = args
+        .iter()
+        .position(|a| a == "--pdf-out")
+        .and_then(|i| args.get(i + 1).cloned())
+        .or_else(|| {
+            args.iter()
+                .find_map(|a| a.strip_prefix("--pdf-out=").map(|s| s.to_string()))
+        });
+
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .manage(AppState {
             startup_file: Mutex::new(startup_file),
+            pdf_out: Mutex::new(pdf_out),
         })
         .setup(|_app| {
             #[cfg(debug_assertions)]
@@ -759,10 +796,13 @@ fn main() {
             reveal_in_explorer,
             open_with_default_app,
             get_startup_file,
+            get_pdf_target,
+            quit_app,
             convert_to_md,
             can_convert,
             convert_supported_exts,
             print_current_window,
+            export_pdf,
             set_window_title,
             get_app_version,
             register_md_assoc,

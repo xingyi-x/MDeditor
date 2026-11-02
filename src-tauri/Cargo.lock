@@ -1851,7 +1851,7 @@ dependencies = [
 
 [[package]]
 name = "mdeditor"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "base64 0.22.1",
  "encoding_rs",
@@ -1866,6 +1866,8 @@ dependencies = [
  "tauri",
  "tauri-build",
  "tauri-plugin-dialog",
+ "webview2-com",
+ "windows",
  "zip",
 ]
 

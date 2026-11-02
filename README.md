@@ -8,11 +8,11 @@
 
 | 文件 | 说明 |
 | --- | --- |
-| `MDeditor-v1.1-setup.exe` | **安装版（推荐）**：含 `.md` 文件关联、开始菜单快捷方式，可在「应用和功能」中卸载 |
-| `MDeditor.exe` | **绿色版**：单文件免安装，双击即用（前端资源已内嵌），同时作为命令行入口 |
+| `MDeditor-v1.2-setup.exe` | **安装版（推荐）**：含 `.md` 文件关联、开始菜单快捷方式，可在「应用和功能」中卸载 |
+| `MDeditor.exe` | **绿色版**：单文件免安装，双击即用（前端资源已内嵌），同时作为命令行入口。仓库 `dist/` 下也带了一份，clone 后可直接运行 |
 | `mdconv.bat` | 命令行转换包装脚本，与 `MDeditor.exe` 放同一目录即可使用 |
 
-> 本机构建产出的安装包名为 `MDeditor-v1.1-安装包.exe`；上传 Releases 时 GitHub 会剔除文件名中的非 ASCII 字符，故下载名为 `MDeditor-v1.1-setup.exe`，两者内容一致。
+> 本机构建产出的安装包名为 `MDeditor-v1.2-安装包.exe`；上传 Releases 时 GitHub 会剔除文件名中的非 ASCII 字符，故下载名为 `MDeditor-v1.2-setup.exe`，两者内容一致。
 
 环境要求：Windows 10/11 x64 + WebView2 Runtime（Windows 11 已内置；Win10 若缺失需[单独安装](https://developer.microsoft.com/microsoft-edge/webview2/)）。
 
@@ -25,7 +25,7 @@
   - 默认按「阅读优先」留白：流式模式四周 56px、A4 页边距 24/20mm，正文宽度 860px
   - 行距 / 首行缩进 / 对齐方式默认「跟随主题」，换主题即换版式（如「仿 Word」自带 2em 缩进 + 两端对齐）；手动改过之后以手动值为准
 - **分页预览**（paged.js）：按纸张真实分页显示
-- **导出**：PDF（系统打印，样式与预览一致）、自包含 HTML、Word（.doc）、纯文本
+- **导出**：PDF（直接生成文件，**无浏览器页眉页脚**）、自包含 HTML（图片与公式字体内嵌）、Word（.doc，版式已扁平化，Word 里能正确显示字体字号行距）、纯文本（去掉 Markdown 记号）
 - **渲染能力**：GFM、任务列表（预览中可直接勾选并回写源码）、表格、代码高亮（highlight.js）、数学公式（KaTeX）、Mermaid 图表（懒加载）
 - **文件管理**：文件夹树浏览、最近打开、全局全文搜索、重命名/删除、在资源管理器中显示
 - **拖拽打开**：把文件直接拖到窗口上即可（有「松开即打开」提示层）——  
@@ -96,6 +96,15 @@ mdeditor.exe --to-md 手册.pdf --front-matter -o 手册.md
 2. 安装版装好后，主程序在 `%LOCALAPPDATA%\MDeditor\MDeditor.exe`，  
    把它所在目录加进 PATH 后可直接 `mdeditor --to-md 报告.pdf`。
 
+### 直接导出 PDF（命令行 / 批处理）
+
+```bat
+:: 打开文档 → 导出 PDF → 自动退出。不弹打印对话框，成品不带浏览器页眉页脚
+mdeditor.exe 报告.md --pdf-out D:\out\报告.pdf
+```
+
+纸张尺寸与页边距取自当前设置（A4/A5/B5/Letter/16K），导出结果与预览一致。
+
 ## 目录结构
 
 ```
@@ -111,9 +120,9 @@ MDeditor/
 │       ├── main.rs       文件读写 / 目录 / 搜索 / 转换命令
 │       ├── cli.rs        命令行模式：--to-md 文档转 Markdown
 │       └── convert/      转换引擎：docx / xlsx / pptx / pdf / html / rtf / plain
-├── dist/               本地打包输出目录（gitignore，仅 mdconv.bat 入库）
-│   ├── MDeditor.exe              绿色版 / 命令行入口
-│   ├── MDeditor-v1.1-安装包.exe    NSIS 安装包
+├── dist/               打包产物
+│   ├── MDeditor.exe              绿色版 / 命令行入口（入库，clone 后可直接运行）
+│   ├── MDeditor-v1.2-安装包.exe    NSIS 安装包（仅 Releases，不入库）
 │   └── mdconv.bat                命令行包装脚本（入库）
 ├── _toolchain/          Rust 工具链（本机自用，gitignore）
 ├── build-release.bat    一键构建 release exe
@@ -153,6 +162,25 @@ cargo tauri build
 | Ctrl+P                         | 打印 / 导出 PDF             |
 | Ctrl+= / Ctrl+-                | 编辑器字号                   |
 | F11                            | 全屏                      |
+
+## 更新日志
+
+### v1.2
+
+- **修复**：导出 PDF 的成品带有浏览器页眉（日期 + 文档标题）与页脚（`tauri.localhost` + 页码）。
+  原先走 `window.print()`，那个开关只能由用户在打印预览里手动取消；现改为直接调用
+  WebView2 的 `PrintToPdf` 并显式 `ShouldPrintHeaderAndFooter=false`，同时按所选纸张设置页面尺寸与页边距。
+- **修复**：导出 Word（.doc）丢失全部版式。Word 的 HTML 引擎不支持 CSS 自定义属性，
+  原先把 `var(--doc-*)` 原样写出，字体、字号、行距、缩进、对齐全部失效；
+  现导出前把变量扁平化为字面值，并写入 `@page WordSection1` 页面设置。
+- **修复**：导出纯文本等于把 `.md` 源码换个扩展名。现按 Markdown 结构拍平：
+  去掉记号，保留标题层级、列表缩进、表格（制表符分隔）、代码块原样，图片降级为 `[图片：alt]`。
+- **新增**：命令行 `--pdf-out <路径>`，无交互导出 PDF（便于批处理与自测）。
+- **新增**：仓库直接附带可运行的 `dist/MDeditor.exe`，clone 后无需构建即可使用。
+
+### v1.1
+
+首个公开版本。
 
 ## 许可证
 

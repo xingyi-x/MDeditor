@@ -6,12 +6,16 @@ node_modules/
 _env_check*.txt
 _msvc*.txt
 
-# ── 构建 / 发布产物：二进制不入库，放 GitHub Releases ──
+# ── 构建 / 发布产物 ──
+# 安装包太大且每次发版都变，只放 GitHub Releases；绿色版 exe 入库，
+# 这样 clone 下来不用装 Rust 工具链也能直接双击使用
 dist/*
-!dist/mdconv.bat
+dist/_old/
 *.exe
 *.msi
 *.pdb
+!dist/mdconv.bat
+!dist/MDeditor.exe
 
 # ── 本地工作数据 / 编辑器状态 ──
 .workbuddy/
