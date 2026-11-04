@@ -1,6 +1,15 @@
 /* ══════════════ 纯文本 / CSV / Markdown 直通 ══════════════ */
 
+/// 原样透传：仅去掉 BOM，保留行尾空格与所有换行。
+/// .md / .markdown 走这里，不经过 text()，避免丢掉 Markdown 硬换行的两个行尾空格。
+pub fn passthrough(data: &[u8]) -> String {
+    let s = decode(data);
+    // decode 已处理 UTF-8 / UTF-16LE BOM；再兜底去掉可能残留的 U+FEFF
+    s.strip_prefix('\u{feff}').unwrap_or(&s).to_string()
+}
+
 pub fn text(data: &[u8]) -> String {
+    // 注意：仅 .txt/.text/.log 等纯文本走这里；.md / .markdown 走 passthrough，不去除行尾空格
     let s = decode(data);
     let s = s.replace("\r\n", "\n").replace('\r', "\n");
     // 折叠连续空行
@@ -24,11 +33,15 @@ pub fn text(data: &[u8]) -> String {
 pub fn delimited(data: &[u8], tab: bool) -> String {
     let s = decode(data);
     let sep = if tab { '\t' } else { ',' };
-    let rows = parse_rows(&s, sep);
+    let (rows, truncated) = parse_rows(&s, sep);
     if rows.is_empty() {
         return String::new();
     }
-    super::docx::render_table(rows)
+    let mut out = super::docx::render_table(rows);
+    if truncated {
+        out.push_str("> … 已截断，仅显示前 2000 行\n");
+    }
+    out
 }
 
 fn decode(data: &[u8]) -> String {
@@ -44,12 +57,13 @@ fn decode(data: &[u8]) -> String {
     }
 }
 
-/// 带引号的 CSV 解析
-fn parse_rows(s: &str, sep: char) -> Vec<Vec<String>> {
+/// 带引号的 CSV 解析；返回 (行, 是否因 2000 行上限被截断)
+fn parse_rows(s: &str, sep: char) -> (Vec<Vec<String>>, bool) {
     let mut rows: Vec<Vec<String>> = Vec::new();
     let mut cur: Vec<String> = Vec::new();
     let mut field = String::new();
     let mut in_quotes = false;
+    let mut truncated = false;
     let mut chars = s.chars().peekable();
     while let Some(c) = chars.next() {
         match c {
@@ -68,7 +82,9 @@ fn parse_rows(s: &str, sep: char) -> Vec<Vec<String>> {
                 cur.push(super::cell_text(&field));
                 field.clear();
                 rows.push(std::mem::take(&mut cur));
-                if rows.len() >= 2000 {
+                if rows.len() >= 2000 && chars.peek().is_some() {
+                    // 后面还有内容：确认被截断
+                    truncated = true;
                     break;
                 }
             }
@@ -79,7 +95,7 @@ fn parse_rows(s: &str, sep: char) -> Vec<Vec<String>> {
             c => field.push(c),
         }
     }
-    if !field.is_empty() || !cur.is_empty() {
+    if !truncated && (!field.is_empty() || !cur.is_empty()) {
         cur.push(super::cell_text(&field));
         rows.push(cur);
     }
@@ -87,5 +103,5 @@ fn parse_rows(s: &str, sep: char) -> Vec<Vec<String>> {
     while rows.last().map(|r| r.iter().all(|c| c.is_empty())).unwrap_or(false) {
         rows.pop();
     }
-    rows
+    (rows, truncated)
 }

@@ -305,7 +305,7 @@ fn parse_paragraph(
                     b"txbxContent" => {
                         extra.push_str(&parse_until(r, buf, b"txbxContent", env));
                     }
-                    b"oMath" | b"OMathPara" => {
+                    b"oMath" | b"oMathPara" => {
                         let t = collect_text(r, buf, &ln);
                         if !t.trim().is_empty() {
                             let mut run = Run::default();
@@ -337,20 +337,26 @@ fn parse_paragraph(
         buf.clear();
     }
 
-    // 组装行内文本
+    // 组装行内文本：连续的同格式 run 先合并，再统一加标记，避免 **前半****后半**
     let mut inline = String::new();
     let mut imgs: Vec<String> = Vec::new();
+    let mut run_buf: Vec<Run> = Vec::new();
     for p in pieces {
         match p {
-            Piece::Text(run) => inline.push_str(&render_run(&run)),
-            Piece::Break => inline.push_str("  \n"),
+            Piece::Text(run) => run_buf.push(run),
+            Piece::Break => {
+                inline.push_str(&render_merged_runs(std::mem::take(&mut run_buf)));
+                inline.push_str("  \n");
+            }
             Piece::Img(rid) => {
+                inline.push_str(&render_merged_runs(std::mem::take(&mut run_buf)));
                 if let Some(p) = resolve_img(&rid, env) {
                     imgs.push(p);
                 }
             }
         }
     }
+    inline.push_str(&render_merged_runs(run_buf));
     if !extra.is_empty() {
         inline.push_str(&extra);
     }
@@ -512,7 +518,8 @@ fn parse_run(r: &mut Reader<&[u8]>, buf: &mut Vec<u8>) -> Run {
                             run.mono = is_mono(&f);
                         }
                     }
-                    b"br" | b"cr" | b"tab" => run.text.push(' '),
+                    b"br" | b"cr" => run.text.push('\n'),
+                    b"tab" => run.text.push(' '),
                     b"blip" => {
                         if let Some(v) = attr(&e, "r:embed").or_else(|| attr(&e, "r:link")) {
                             run.img = Some(v);
@@ -534,7 +541,8 @@ fn parse_run(r: &mut Reader<&[u8]>, buf: &mut Vec<u8>) -> Run {
                         run.mono = is_mono(&f);
                     }
                 }
-                b"br" | b"cr" | b"tab" => run.text.push(' '),
+                b"br" | b"cr" => run.text.push('\n'),
+                b"tab" => run.text.push(' '),
                 b"blip" => {
                     if let Some(v) = attr(&e, "r:embed").or_else(|| attr(&e, "r:link")) {
                         run.img = Some(v);
@@ -567,7 +575,7 @@ fn toggle(e: &BytesStart, default: bool) -> bool {
 }
 
 fn parse_hyperlink_text(r: &mut Reader<&[u8]>, buf: &mut Vec<u8>) -> String {
-    let mut s = String::new();
+    let mut runs: Vec<Run> = Vec::new();
     loop {
         match r.read_event_into(buf) {
             Ok(Event::Eof) => break,
@@ -578,15 +586,41 @@ fn parse_hyperlink_text(r: &mut Reader<&[u8]>, buf: &mut Vec<u8>) -> String {
             }
             Ok(Event::Start(e)) => {
                 if e.local_name().as_ref() == b"r" {
-                    let run = parse_run(r, buf);
-                    s.push_str(&render_run(&run));
+                    runs.push(parse_run(r, buf));
                 }
             }
             _ => {}
         }
         buf.clear();
     }
-    s.trim().to_string()
+    render_merged_runs(runs).trim().to_string()
+}
+
+/// 两个 run 的格式标记是否完全一致（同格式才合并）
+fn same_format(a: &Run, b: &Run) -> bool {
+    a.b == b.b && a.i == b.i && a.mono == b.mono && a.link == b.link
+}
+
+/// 合并相邻同格式 run 后统一渲染，避免同格式的相邻 run 各自包 **…** 产生 **前半****后半**
+fn render_merged_runs(runs: Vec<Run>) -> String {
+    let mut out = String::new();
+    let mut pending: Option<Run> = None;
+    for run in runs {
+        if let Some(prev) = pending.as_mut() {
+            if same_format(prev, &run) {
+                prev.text.push_str(&run.text);
+            } else {
+                out.push_str(&render_run(prev));
+                *prev = run;
+            }
+        } else {
+            pending = Some(run);
+        }
+    }
+    if let Some(prev) = pending.take() {
+        out.push_str(&render_run(&prev));
+    }
+    out
 }
 
 fn render_run(run: &Run) -> String {
@@ -658,7 +692,6 @@ fn level_from_name(s: &str) -> Option<u8> {
     if low.starts_with("heading")
         || low.starts_with("标题")
         || low.starts_with("標題")
-        || low.starts_with("heading")
     {
         let digits: String = low.chars().filter(|c| c.is_ascii_digit()).collect();
         if let Ok(n) = digits.parse::<u8>() {
@@ -697,6 +730,13 @@ fn list_marker(num_id: Option<&str>, ilvl: usize, numbering: &NumMap) -> Option<
 
 /* ────────── 表格 ────────── */
 
+/// 单元格解析结果：文本 + 横向跨度 + 是否为纵向合并的延续单元格
+struct Cell {
+    text: String,
+    grid_span: usize,
+    vmerge_cont: bool,
+}
+
 fn parse_table(r: &mut Reader<&[u8]>, buf: &mut Vec<u8>, env: &Env) -> String {
     let mut rows: Vec<Vec<String>> = Vec::new();
     loop {
@@ -731,7 +771,14 @@ fn parse_row(r: &mut Reader<&[u8]>, buf: &mut Vec<u8>, env: &Env) -> Vec<String>
             }
             Ok(Event::Start(e)) => {
                 if e.local_name().as_ref() == b"tc" {
-                    cells.push(parse_cell(r, buf, env));
+                    let cell = parse_cell(r, buf, env);
+                    // 纵向合并的延续单元格：清空文本但保留占位，避免后续行错列
+                    let text = if cell.vmerge_cont { String::new() } else { cell.text };
+                    cells.push(text);
+                    // gridSpan：补 span-1 个空单元格，保证列对齐
+                    for _ in 1..cell.grid_span {
+                        cells.push(String::new());
+                    }
                 }
             }
             _ => {}
@@ -741,8 +788,10 @@ fn parse_row(r: &mut Reader<&[u8]>, buf: &mut Vec<u8>, env: &Env) -> Vec<String>
     cells
 }
 
-fn parse_cell(r: &mut Reader<&[u8]>, buf: &mut Vec<u8>, env: &Env) -> String {
+fn parse_cell(r: &mut Reader<&[u8]>, buf: &mut Vec<u8>, env: &Env) -> Cell {
     let mut parts: Vec<String> = Vec::new();
+    let mut grid_span = 1usize;
+    let mut vmerge_cont = false;
     loop {
         match r.read_event_into(buf) {
             Ok(Event::Eof) => break,
@@ -752,11 +801,98 @@ fn parse_cell(r: &mut Reader<&[u8]>, buf: &mut Vec<u8>, env: &Env) -> String {
                 }
             }
             Ok(Event::Start(e)) => {
-                if e.local_name().as_ref() == b"p" {
-                    if let Some(s) = parse_paragraph(r, buf, env, true) {
-                        if !s.is_empty() {
-                            parts.push(s);
+                let ln = e.local_name().as_ref().to_vec();
+                match ln.as_slice() {
+                    b"p" => {
+                        if let Some(s) = parse_paragraph(r, buf, env, true) {
+                            if !s.is_empty() {
+                                parts.push(s);
+                            }
                         }
+                    }
+                    b"tcPr" => {
+                        let (span, cont) = parse_tcpr(r, buf);
+                        grid_span = span;
+                        vmerge_cont = cont;
+                    }
+                    b"tbl" => {
+                        // 嵌套表格：整体消费掉，降级为把内层文本用 <br> 拼进外层单元格；
+                        // 内层的 </w:tc> 不会泄漏到本层循环，避免提前结束外层单元格
+                        let inner = parse_table_text(r, buf, env);
+                        if !inner.is_empty() {
+                            parts.push(inner);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
+        buf.clear();
+    }
+    Cell { text: super::cell_text(&parts.join("<br>")), grid_span, vmerge_cont }
+}
+
+/// 读取 w:tcPr 内的 gridSpan / vMerge（消费到 </w:tcPr>）
+fn parse_tcpr(r: &mut Reader<&[u8]>, buf: &mut Vec<u8>) -> (usize, bool) {
+    let mut span = 1usize;
+    let mut cont = false;
+    loop {
+        match r.read_event_into(buf) {
+            Ok(Event::Eof) => break,
+            Ok(Event::End(e)) => {
+                if e.local_name().as_ref() == b"tcPr" {
+                    break;
+                }
+            }
+            Ok(Event::Start(e)) | Ok(Event::Empty(e)) => match e.local_name().as_ref() {
+                b"gridSpan" => {
+                    if let Some(v) = attr(&e, "val") {
+                        span = v.parse::<usize>().unwrap_or(1).max(1);
+                    }
+                }
+                b"vMerge" => {
+                    // restart 表示合并起始（保留内容），无 val 或非 restart 表示延续（清空占位）
+                    let is_restart = attr(&e, "val")
+                        .map(|v| v.eq_ignore_ascii_case("restart"))
+                        .unwrap_or(false);
+                    cont = !is_restart;
+                }
+                _ => {}
+            },
+            _ => {}
+        }
+        buf.clear();
+    }
+    (span, cont)
+}
+
+/// 把嵌套 w:tbl 的文本拼成一段（消费到 </w:tbl>），避免内层 </w:tc> 提前关闭外层单元格
+fn parse_table_text(r: &mut Reader<&[u8]>, buf: &mut Vec<u8>, env: &Env) -> String {
+    let mut lines: Vec<String> = Vec::new();
+    let mut tbl_depth = 1i32;
+    loop {
+        match r.read_event_into(buf) {
+            Ok(Event::Eof) => break,
+            Ok(Event::Start(e)) => {
+                let ln = e.local_name().as_ref().to_vec();
+                match ln.as_slice() {
+                    b"tbl" => tbl_depth += 1,
+                    b"p" => {
+                        if let Some(s) = parse_paragraph(r, buf, env, true) {
+                            if !s.is_empty() {
+                                lines.push(s);
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            Ok(Event::End(e)) => {
+                if e.local_name().as_ref() == b"tbl" {
+                    tbl_depth -= 1;
+                    if tbl_depth <= 0 {
+                        break;
                     }
                 }
             }
@@ -764,7 +900,7 @@ fn parse_cell(r: &mut Reader<&[u8]>, buf: &mut Vec<u8>, env: &Env) -> String {
         }
         buf.clear();
     }
-    super::cell_text(&parts.join("<br>"))
+    lines.join("<br>")
 }
 
 pub fn render_table(rows: Vec<Vec<String>>) -> String {

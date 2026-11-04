@@ -24,11 +24,34 @@
   }
 
   /* ───────── Tauri 模式：直接映射到 Rust 命令 ───────── */
+  // 打开文件时记录原始编码 / BOM / 换行风格，保存时按原样写回。
+  // 不这么做的话，GBK 或 UTF-16 的文档一旦编辑就会被静默改成无 BOM UTF-8 + LF。
+  const fileMeta = new Map();
   const tauriImpl = {
     sep: '\\',
     join: U.joinPath,
-    async readFile(p) { return invoke('read_text_file', { path: p }); },
-    async writeFile(p, content) { await invoke('write_text_file', { path: p, content }); },
+    async readFile(p) {
+      const info = await invoke('read_text_file', { path: p });
+      if (info && typeof info === 'object' && typeof info.text === 'string') {
+        fileMeta.set(p, { encoding: info.encoding, bom: !!info.bom, eol: info.eol });
+        return info.text;
+      }
+      return info; // 兼容只返回字符串的旧后端
+    },
+    async writeFile(p, content) {
+      const m = fileMeta.get(p) || {};
+      await invoke('write_text_file', {
+        path: p,
+        content,
+        encoding: m.encoding || 'utf-8',
+        bom: !!m.bom,
+        eol: m.eol || '\n',
+      });
+    },
+    /** 重命名 / 另存为之后把编码信息带到新路径 */
+    inheritMeta(from, to) {
+      if (fileMeta.has(from)) fileMeta.set(to, fileMeta.get(from));
+    },
     async readImageDataURL(p) { return invoke('read_image_data_url', { path: p }); },
     async writeBinary(p, data) { await invoke('write_base64_file', { path: p, data }); },
     async listDir(p) {
@@ -92,8 +115,13 @@
     async pdfTarget() {
       try { return await invoke('get_pdf_target', {}); } catch (e) { return null; }
     },
-    async quit() {
-      try { await invoke('quit_app', {}); } catch (e) { window.close(); }
+    async quit(code) {
+      // --pdf-out 自动化导出用退出码回报成功/失败
+      const args = typeof code === 'number' ? { code } : {};
+      try { await invoke('quit_app', args); } catch (e) { window.close(); }
+    },
+    async appVersion() {
+      try { return await invoke('get_app_version', {}); } catch (e) { return ''; }
     },
     async setWindowTitle(t) {
       try { await invoke('set_window_title', { title: t }); } catch (e) { document.title = t; }
@@ -278,6 +306,8 @@
     async startupFile() { return null; },
     async pdfTarget() { return null; },
     async quit() { window.close(); },
+    async appVersion() { return ''; },
+    inheritMeta() {},
     async setWindowTitle(t) { document.title = t; },
     async registerMdAssoc() { throw new Error('仅桌面版支持'); },
     async mdAssocStatus() { return false; },

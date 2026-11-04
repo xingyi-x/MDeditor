@@ -216,6 +216,62 @@
     if (MD.md && MD.md.refreshMermaidTheme) MD.md.refreshMermaidTheme();
   }
 
+  /** 把主题的 extraCSS 作用域限定到 #preview-stage 内：
+   *  普通规则选择器加前缀，@media/@supports 递归处理内部规则，
+   *  @keyframes/@font-face 等原样保留；CSSOM 解析失败时退化为输出原文。 */
+  function scopeExtraCss(css) {
+    if (!css || !String(css).trim()) return '';
+    let temp = null;
+    try {
+      temp = document.createElement('style');
+      temp.textContent = css;
+      document.head.appendChild(temp);
+      const sheet = temp.sheet;
+      if (!sheet || !sheet.cssRules) throw new Error('无法读取 cssRules');
+      const prefix = (selectorText) => selectorText.split(',').map((s) => {
+        const sel = s.trim();
+        if (!sel || sel.indexOf('#preview-stage') === 0) return sel;
+        return '#preview-stage ' + sel;
+      }).join(', ');
+      const out = [];
+      const walk = (rules, indent) => {
+        for (const r of rules) {
+          if (r.type === CSSRule.STYLE_RULE) {
+            out.push(indent + prefix(r.selectorText) + ' { ' + r.style.cssText + ' }');
+          } else if (r.type === CSSRule.MEDIA_RULE || r.type === CSSRule.SUPPORTS_RULE) {
+            const head = r.type === CSSRule.MEDIA_RULE
+              ? '@media ' + r.conditionText
+              : '@supports ' + r.conditionText;
+            out.push(indent + head + ' {');
+            walk(r.cssRules, indent + '  ');
+            out.push(indent + '}');
+          } else {
+            // @keyframes / @font-face / @import 等保持原样，不加作用域前缀
+            out.push(indent + r.cssText);
+          }
+        }
+      };
+      walk(sheet.cssRules, '');
+      return out.join('\n');
+    } catch (e) {
+      return String(css);
+    } finally {
+      if (temp && temp.parentNode) temp.parentNode.removeChild(temp);
+    }
+  }
+
+  /** 应用内预览：维护 <style id="theme-extra">，让主题的附加 CSS 真正生效 */
+  function applyExtraCss() {
+    let el = U.$('#theme-extra');
+    if (!el) {
+      el = document.createElement('style');
+      el.id = 'theme-extra';
+      document.head.appendChild(el);
+    }
+    const theme = getTheme(MD.settings.docTheme);
+    el.textContent = scopeExtraCss(theme.extraCSS || '');
+  }
+
   function applyDoc() {
     const theme = getTheme(MD.settings.docTheme);
     const stage = U.$('#preview-stage');
@@ -290,6 +346,7 @@
       const fp = s.flowPadding != null ? s.flowPadding : 56;
       pageStyle.textContent = `@page { margin: ${Math.round(fp * 0.75)}px ${fp}px; }`;
     }
+    applyExtraCss();
     applyUI();
     MD.bus.emit('theme:applied');
   }
@@ -560,7 +617,7 @@
       <div class="ctl-row"><label>基于主题</label><span style="color:var(--ui-muted)">${isCustom ? (s.customThemes[editingThemeId].base || '—') : '内置主题'}</span></div>
       <div class="ctl-title">颜色</div>
       ${THEME_FIELDS.map(([k, label]) => `
-        <div class="ctl-row"><label>${label}</label><input type="color" data-te="${k}" value="${toHex(cur.vars[k] || '#ffffff')}"></div>
+        <div class="ctl-row"><label>${label}</label><input type="color" data-te="${k}" data-orig="${U.esc(cur.vars[k] || '')}" value="${colorInputVal(cur.vars[k] || '#ffffff')}"></div>
       `).join('')}
       <hr class="ctl-sep">
       <div class="ctl-title">字体</div>
@@ -605,7 +662,13 @@
     const collectDraft = () => {
       const base = JSON.parse(JSON.stringify(getTheme(editingThemeId)));
       base.name = U.$('#te-name', body).value.trim() || base.name;
-      U.$$('[data-te]', body).forEach((inp) => { base.vars[inp.dataset.te] = inp.value; });
+      U.$$('[data-te]', body).forEach((inp) => {
+        const orig = inp.dataset.orig || '';
+        // 未被用户改动时保留原始值（含 rgba 透明度），避免 type="color" 只能显示
+        // 6 位实色、保存时把半透明高亮压成实色
+        if (orig && inp.value.toLowerCase() === colorInputVal(orig).toLowerCase()) return;
+        base.vars[inp.dataset.te] = inp.value;
+      });
       base.vars['--doc-font-body'] = U.$('#te-font-body', body).value;
       base.vars['--doc-font-heading'] = U.$('#te-font-head', body).value;
       base.vars['--doc-font-mono'] = U.$('#te-font-mono', body).value;
@@ -681,13 +744,30 @@
 
   function toHex(c) {
     if (!c) return '#ffffff';
-    if (c.startsWith('#')) return c.slice(0, 7);
-    const m = /rgba?\((\d+),\s*(\d+),\s*(\d+)/.exec(c);
+    const s = String(c).trim();
+    if (s.startsWith('#')) {
+      // 3 位 #abc → #aabbcc（type="color" 只认 6 位）
+      if (/^#[0-9a-fA-F]{3}$/.test(s)) return '#' + s[1] + s[1] + s[2] + s[2] + s[3] + s[3];
+      // 4 位 #rgba → #rrggbbaa，保留透明度
+      if (/^#[0-9a-fA-F]{4}$/.test(s)) return '#' + s[1]+s[1] + s[2]+s[2] + s[3]+s[3] + s[4]+s[4];
+      // 6 位 / 8 位原样返回（8 位保留 alpha）
+      if (/^#[0-9a-fA-F]{6}([0-9a-fA-F]{2})?$/.test(s)) return s;
+      return '#ffffff';
+    }
+    const m = /^rgba?\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*(?:,\s*([\d.]+)\s*)?\)$/i.exec(s);
     if (m) {
-      const h = (n) => n.toString(16).padStart(2, '0');
-      return '#' + h(+m[1]) + h(+m[2]) + h(+m[3]);
+      const h = (n) => Math.max(0, Math.min(255, Math.round(+n || 0))).toString(16).padStart(2, '0');
+      let out = '#' + h(m[1]) + h(m[2]) + h(m[3]);
+      // 带 alpha 且非完全不透明：补 8 位 hex，避免保存后高亮色从半透明变实色
+      if (m[4] != null && parseFloat(m[4]) < 1) out += h(Math.round(parseFloat(m[4]) * 255));
+      return out;
     }
     return '#ffffff';
+  }
+  /** type="color" 只能显示 6 位实色，含透明度的 8 位 hex 先截成 6 位 */
+  function colorInputVal(c) {
+    const h = toHex(c || '#ffffff');
+    return h.length === 9 ? h.slice(0, 7) : h;
   }
 
   /* ══════════ 设置面板 ══════════ */
@@ -722,7 +802,7 @@
       <hr class="ctl-sep">
       <div class="ctl-title">关于</div>
       <div style="color:var(--ui-muted);line-height:2;font-size:12.5px">
-        MDeditor v1.1 —— 本地 Markdown 阅读与排版编辑器<br>
+        MDeditor <span id="se-version">v1.3</span> —— 本地 Markdown 阅读与排版编辑器<br>
         运行环境：${MD.fsx.isApp ? 'MDeditor 桌面应用（Tauri）' : '浏览器模式（部分功能受限）'}<br>
         所有文件均保存在本地，不上传任何数据。<br>
         渲染内核：marked + highlight.js + KaTeX + Mermaid + paged.js
@@ -733,16 +813,20 @@
       </div>
       <div class="disclaimer">
         <b>免责声明</b><br>
-        本软件为个人自用的本地工具，<b>仅供个人学习、研究与日常写作使用，不得用于任何商业用途</b>，
-        也不得将其整体或部分用于对外提供商业服务、产品交付或收费分发。<br>
+        本软件按 <b>MIT 许可证</b>发布（见 LICENSE），允许个人与商业使用、复制、修改和分发，
+        使用时须保留版权与许可声明。<br>
         软件按「现状」提供，不对适用性、稳定性、兼容性及数据安全作任何明示或默示的担保；
         请在使用前自行备份重要文件，并对编辑与导出的结果自行核对。<br>
         使用者因使用或无法使用本软件而产生的任何直接或间接损失（含数据丢失、业务中断、利润损失），
-        以及由此引发的任何商业纠纷、侵权争议或法律责任，均由使用者自行承担，开发者不承担任何责任。<br>
-        若您将本软件用于商业场景，视为您已自行评估并承担全部风险。
+        均由使用者自行承担，开发者不承担任何责任。
       </div>
       <div class="btn-row"><button class="btn" id="se-help">查看快捷键</button></div>
     `;
+    // 版本号以 Cargo.toml / tauri.conf.json 为唯一来源，不再在界面里写死
+    const verEl = U.$('#se-version', body);
+    if (verEl && MD.fsx.appVersion) {
+      MD.fsx.appVersion().then((v) => { if (v) verEl.textContent = 'v' + v; }).catch(() => {});
+    }
     U.$('#se-ui', body).addEventListener('change', (e) => { MD.settings.uiTheme = e.target.value; applyDoc(); MD.saveSettings(); });
     U.$('#se-cmfs', body).addEventListener('input', (e) => {
       const px = parseFloat(e.target.value);
@@ -796,7 +880,7 @@
       ['Ctrl+Shift+Q', '引用'], ['Ctrl+F / Ctrl+H', '查找 / 替换（编辑器内）'],
       ['Alt+1..4', '源码 / 分栏 / 预览 / 阅读模式'], ['Ctrl+\\', '显示/隐藏侧栏'],
       ['Esc', '退出阅读模式 / 关闭面板'],
-      ['Ctrl+P', '打印 / 导出 PDF'], ['Ctrl+= / Ctrl+-', '编辑器字号增减'],
+      ['Ctrl+P', '导出 PDF（直接落盘，无页眉页脚）'], ['Ctrl+= / Ctrl+-', '编辑器字号增减'],
       ['Ctrl+滚轮', '放大 / 缩小画面'], ['Ctrl+0', '画面缩放回到 100%'],
       ['F11', '全屏'],
     ];

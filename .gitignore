@@ -18,11 +18,20 @@ dist/_old/
 !dist/MDeditor.exe
 
 # ── 本地工作数据 / 编辑器状态 ──
+# 「最近打开」列表、窗口状态、主题等运行时数据只存在 WebView2 的
+# localStorage（本机用户目录），不写进仓库；下列模式是防止误提交的兜底。
 .workbuddy/
 .vscode/
 .idea/
+settings.json
+recent*.json
+*.mde-state
+*.mde-session
+EBWebView/
 
-# ── 临时与调试输出 ──
+# ── 备份、回归产物与调试输出（本地，不上传）──
+_backup/
+_verify/
 /1
 _*.txt
 *.tmp

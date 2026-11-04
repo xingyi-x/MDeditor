@@ -7,6 +7,34 @@ const IGNORE_DEST: &[&str] = &[
     "revtim", "printim", "buptim", "protusertbl", "xe", "tc", "*",
 ];
 
+/// 一位十六进制字符 → 数值（按字节判断，避免字符串切片越过 UTF-8 边界）
+fn hex_val(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
+}
+
+/// \uN 之后按 \ucN 跳过 N 个替代字符：可能是普通 ?，也可能是 \'hh 形式（跳过 \' + 两位十六进制）
+fn skip_fallback(i: &mut usize, s: &str, count: i32) {
+    let bytes = s.as_bytes();
+    let mut n = count.max(0);
+    while n > 0 && *i < s.len() {
+        if bytes[*i] == b'\\' && *i + 1 < s.len() && bytes[*i + 1] == b'\'' {
+            *i += 2;
+            while *i < s.len() && bytes[*i].is_ascii_hexdigit() {
+                *i += 1;
+            }
+        } else {
+            let len = s[*i..].chars().next().map(|c| c.len_utf8()).unwrap_or(1);
+            *i += len;
+        }
+        n -= 1;
+    }
+}
+
 pub fn convert(data: &[u8]) -> Result<String, String> {
     let raw = String::from_utf8_lossy(data);
     let enc = detect_encoding(&raw);
@@ -17,7 +45,10 @@ pub fn convert(data: &[u8]) -> Result<String, String> {
     let mut pending: Vec<u8> = Vec::new();
     let mut bold = false;
     let mut italic = false;
-    let mut stack: Vec<(bool, bool)> = Vec::new();
+    // 栈元素：(bold, italic, uc)，uc 随分组压栈/出栈以恢复作用域
+    let mut stack: Vec<(bool, bool, i32)> = Vec::new();
+    let mut uc: i32 = 1; // \ucN 默认 1
+    let mut high_surrogate: Option<u32> = None; // \uN 的高代理（UTF-16 代理对）
     let mut depth: i32 = 0;
     let mut skip_to: Option<i32> = None;
     let mut i = 0usize;
@@ -36,12 +67,12 @@ pub fn convert(data: &[u8]) -> Result<String, String> {
             b'{' => {
                 flush_pending(&mut pending, &mut out, enc);
                 depth += 1;
-                stack.push((bold, italic));
+                stack.push((bold, italic, uc));
                 i += 1;
             }
             b'}' => {
                 flush_pending(&mut pending, &mut out, enc);
-                if let Some((b, it)) = stack.pop() {
+                if let Some((b, it, u)) = stack.pop() {
                     if b != bold {
                         out.push_str("**");
                     }
@@ -50,6 +81,7 @@ pub fn convert(data: &[u8]) -> Result<String, String> {
                     }
                     bold = b;
                     italic = it;
+                    uc = u;
                 }
                 depth -= 1;
                 if let Some(d) = skip_to {
@@ -60,16 +92,55 @@ pub fn convert(data: &[u8]) -> Result<String, String> {
                 i += 1;
             }
             b'\\' => {
-                // \'hh 十六进制字节
-                if i + 1 < s.len() && bytes[i + 1] == b'\'' && i + 3 < s.len() {
-                    if let Ok(v) = u8::from_str_radix(&s[i + 2..i + 4], 16) {
-                        pending.push(v);
-                        i += 4;
+                // ① 忽略目标组（如 {\fonttbl …\'cb\'ce…}）：整段跳过。
+                //    必须先于 \'hh 判断，否则被忽略组里的十六进制字节会混进正文。
+                if skip_to.is_some() {
+                    if i + 1 < s.len() && bytes[i + 1] == b'\'' {
+                        i += 2;
+                        while i < s.len() && bytes[i].is_ascii_hexdigit() {
+                            i += 1;
+                        }
                         continue;
                     }
+                    i += 1; // 跳过反斜杠
+                    if i >= s.len() {
+                        break;
+                    }
+                    if !bytes[i].is_ascii_alphabetic() {
+                        // 控制符：按 UTF-8 字符跳过，保证 i 落在字符边界
+                        let len = s[i..].chars().next().map(|c| c.len_utf8()).unwrap_or(1);
+                        i += len;
+                        continue;
+                    }
+                    while i < s.len() && bytes[i].is_ascii_alphabetic() {
+                        i += 1;
+                    }
+                    if i < s.len() && bytes[i] == b'-' {
+                        i += 1;
+                    }
+                    while i < s.len() && bytes[i].is_ascii_digit() {
+                        i += 1;
+                    }
+                    if i < s.len() && bytes[i] == b' ' {
+                        i += 1;
+                    }
+                    continue;
                 }
+
+                // ② \'hh 十六进制字节：按字节读取，只在 ASCII 范围判断，避免 UTF-8 边界 panic
+                if i + 1 < s.len() && bytes[i + 1] == b'\'' {
+                    let h1 = if i + 2 < s.len() { hex_val(bytes[i + 2]) } else { None };
+                    let h2 = if i + 3 < s.len() { hex_val(bytes[i + 3]) } else { None };
+                    if let (Some(a), Some(b)) = (h1, h2) {
+                        pending.push((a << 4) | b);
+                        i += 4;
+                    } else {
+                        i += 2;
+                    }
+                    continue;
+                }
+
                 i += 1;
-                // 控制符（非字母）
                 if i >= s.len() {
                     break;
                 }
@@ -92,7 +163,7 @@ pub fn convert(data: &[u8]) -> Result<String, String> {
                     i += 1;
                     continue;
                 }
-                // 控制字
+                // 控制字（字母均为 ASCII，切片一定落在字符边界）
                 let start = i;
                 while i < s.len() && bytes[i].is_ascii_alphabetic() {
                     i += 1;
@@ -117,22 +188,32 @@ pub fn convert(data: &[u8]) -> Result<String, String> {
                     i += 1;
                 }
 
-                if skip_to.is_some() {
-                    continue;
-                }
-
+                // ③ \uN：输出 Unicode 字符，再按 \ucN 跳过替代字符；处理 UTF-16 代理对
                 if word == "u" {
                     flush_pending(&mut pending, &mut out, enc);
                     if let Some(n) = param {
-                        let n = if n < 0 { n + 65536 } else { n };
-                        if let Some(ch) = char::from_u32(n as u32) {
-                            out.push(ch);
+                        let n16 = if n < 0 { (n + 65536) as u32 } else { n as u32 };
+                        if (0xD800..=0xDBFF).contains(&n16) {
+                            high_surrogate = Some(n16);
+                        } else if (0xDC00..=0xDFFF).contains(&n16) {
+                            if let Some(hi) = high_surrogate.take() {
+                                let cp = 0x10000 + (((hi - 0xD800) << 10) | (n16 - 0xDC00));
+                                if let Some(ch) = char::from_u32(cp) {
+                                    out.push(ch);
+                                }
+                            } else {
+                                out.push('\u{FFFD}');
+                            }
+                        } else {
+                            if high_surrogate.take().is_some() {
+                                out.push('\u{FFFD}');
+                            }
+                            if let Some(ch) = char::from_u32(n16) {
+                                out.push(ch);
+                            }
                         }
                     }
-                    // 跳过紧随的替代字符（通常是 ?）
-                    if i < s.len() && bytes[i] == b'?' {
-                        i += 1;
-                    }
+                    skip_fallback(&mut i, s, uc);
                     continue;
                 }
 
@@ -142,6 +223,11 @@ pub fn convert(data: &[u8]) -> Result<String, String> {
                 }
 
                 match word {
+                    "uc" => {
+                        if let Some(v) = param {
+                            uc = v.max(0);
+                        }
+                    }
                     "par" | "sect" | "page" | "row" => {
                         flush_pending(&mut pending, &mut out, enc);
                         out.push_str("\n\n");
@@ -217,7 +303,8 @@ pub fn convert(data: &[u8]) -> Result<String, String> {
             }
             _ => {
                 if skip_to.is_some() {
-                    i += 1;
+                    let len = s[i..].chars().next().map(|c| c.len_utf8()).unwrap_or(1);
+                    i += len;
                     continue;
                 }
                 flush_pending(&mut pending, &mut out, enc);
@@ -242,7 +329,7 @@ fn detect_encoding(s: &str) -> &'static encoding_rs::Encoding {
         let rest = &s[idx + 8..];
         let end = rest
             .find(|c: char| !c.is_ascii_digit())
-            .unwrap_or(rest.len().min(6));
+            .unwrap_or_else(|| rest.char_indices().nth(6).map(|(i, _)| i).unwrap_or(rest.len()));
         if let Ok(cp) = rest[..end].parse::<u32>() {
             match cp {
                 936 | 10008 => return encoding_rs::GBK,

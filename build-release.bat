@@ -2,9 +2,13 @@
 rem Build MDeditor release exe. Requires: Rust toolchain already installed by setup.
 setlocal
 set ROOT=%~dp0
-set "PATH=%ROOT%_toolchain\cargo\bin;%PATH%"
-set "CARGO_HOME=%ROOT%_toolchain\cargo"
-set "RUSTUP_HOME=%ROOT%_toolchain\rustup"
+rem Only override the toolchain when this repo carries a private _toolchain.
+rem Fresh clones use the system Rust installation instead of failing on a missing toolchain.
+if exist "%ROOT%_toolchain\cargo\bin\cargo.exe" (
+  set "PATH=%ROOT%_toolchain\cargo\bin;%PATH%"
+  set "CARGO_HOME=%ROOT%_toolchain\cargo"
+  set "RUSTUP_HOME=%ROOT%_toolchain\rustup"
+)
 cd /d "%ROOT%src-tauri"
 cargo build --release
 if errorlevel 1 (

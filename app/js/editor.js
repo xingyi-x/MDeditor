@@ -5,6 +5,8 @@
   const U = MD.util;
   let cm = null;
   let typewriter = false;
+  // 整体替换（set value）期间抑制 change 事件，避免误触发自动保存把旧文件写回
+  let _settingValue = false;
 
   function init(hostEl) {
     cm = CodeMirror(hostEl, {
@@ -49,7 +51,9 @@
     });
 
     cm.on('change', (_c, changeObj) => {
-      if (changeObj.origin === 'setValue') return;
+      // setValue 的整体替换不算用户编辑：否则打开/新建/关闭后紧跟的 markDirty(false)
+      // 会被 1.5 秒后的自动保存推翻，把上一个文件的内容写回当前文件
+      if (_settingValue || changeObj.origin === 'setValue') return;
       MD.bus.emit('doc:changed');
     });
     cm.on('cursorActivity', () => {
@@ -89,9 +93,17 @@
   function wrapSelection(before, after, placeholder) {
     const sel = cm.getSelection();
     if (sel) {
+      // 先记下替换前选区的起止（anchor/head 按位置排序），替换后据此重新选中内容；
+      // 旧写法用替换后光标反推列号，多行选区会算出负数列
+      const r = cm.listSelections()[0];
+      const a = r.anchor, h = r.head;
+      const aFirst = a.line < h.line || (a.line === h.line && a.ch <= h.ch);
+      const from = aFirst ? { line: a.line, ch: a.ch } : { line: h.line, ch: h.ch };
+      const to = aFirst ? { line: h.line, ch: h.ch } : { line: a.line, ch: a.ch };
       cm.replaceSelection(before + sel + after);
-      cm.setSelection({ line: cm.getCursor().line, ch: cm.getCursor().ch - after.length - sel.length },
-        { line: cm.getCursor().line, ch: cm.getCursor().ch - after.length });
+      // 多行时终点列用替换后该行的实际长度兜底，确保不为负、不越界
+      const endCh = Math.min(to.ch + before.length, (cm.getLine(to.line) || '').length);
+      cm.setSelection({ line: from.line, ch: from.ch + before.length }, { line: to.line, ch: endCh });
     } else {
       const cur = cm.getCursor();
       cm.replaceRange(before + (placeholder || '') + after, cur, cur);
@@ -159,34 +171,40 @@
   };
 
   /* ── 从预览切换任务勾选 ── */
+  // 与 MD.md.taskLines 共用同一套匹配：跳过代码围栏，允许 > 引用、有序/无序前缀
+  const TASK_LINE_RE = /^(\s*(?:>\s*)*(?:[-*+]|\d+[.)])\s+\[)([ xX])(\])/;
+  /** 按源码行号回写任务勾选状态（行号来自统一扫描），避免按「第 N 个」错位 */
+  function setTaskByLine(lineNo, checked) {
+    const text = cm.getLine(lineNo);
+    if (text == null) return false;
+    const m = TASK_LINE_RE.exec(text);
+    if (!m) return false;
+    const next = m[1] + (checked ? 'x' : ' ') + m[3] + text.slice(m[0].length);
+    cm.replaceRange(next, { line: lineNo, ch: 0 }, { line: lineNo, ch: text.length }, { origin: '+task' });
+    return true;
+  }
+  /** 兼容包装：第 index 个任务项 → 源码行号 → 按行回写 */
   function setTaskByIndex(index, checked) {
-    const text = cm.getValue();
-    let n = -1;
-    const lines = text.split('\n');
-    for (let i = 0; i < lines.length; i++) {
-      const m = /^(\s*[-*+]\s+\[)([ xX])(\])/.exec(lines[i]);
-      if (m) {
-        n++;
-        if (n === index) {
-          lines[i] = m[1] + (checked ? 'x' : ' ') + m[3];
-          const from = { line: i, ch: 0 };
-          const to = { line: i, ch: cm.getLine(i).length };
-          cm.replaceRange(lines[i], from, to, { origin: '+task' });
-          return true;
-        }
-      }
-    }
-    return false;
+    const lineNo = MD.md.taskLines(cm.getValue())[index];
+    if (lineNo == null) return false;
+    return setTaskByLine(lineNo, checked);
   }
 
   MD.editor = {
     init,
     get cm() { return cm; },
     get value() { return cm ? cm.getValue() : ''; },
-    set value(v) { if (cm) cm.setValue(v); },
+    set value(v) {
+      if (!cm) return;
+      _settingValue = true;
+      try { cm.setValue(v); } finally { _settingValue = false; }
+      // 打开/新建/关闭后清掉撤销历史，避免 Ctrl+Z 把上一个文件内容写回当前文件
+      cm.clearHistory();
+      cm.markClean();
+    },
     focus: () => cm && cm.focus(),
     actions,
-    setTaskByIndex,
+    setTaskByIndex, setTaskByLine,
     setTypewriter(on) { typewriter = !!on; },
     getTypewriter: () => typewriter,
     scrollToLine(line) {

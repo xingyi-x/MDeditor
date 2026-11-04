@@ -130,9 +130,30 @@
   }
 
   /* ══════════ 最近打开 ══════════ */
-  function renderRecent() {
+  function removeRecent(path) {
+    S().recentFiles = (S().recentFiles || []).filter((f) => f.path !== path);
+    MD.saveSettings();
+    renderRecent();
+  }
+  async function renderRecent() {
     const box = U.$('#recent-list');
-    const list = (S().recentFiles || []).slice(0, 12);
+    let list = (S().recentFiles || []).slice();
+    // 桌面版路径是真实文件，异步清掉已不存在的项；
+    // 浏览器模式的文件句柄不跨会话，exists 会全部失败，跳过清理避免误删。
+    if (MD.fsx.isApp && MD.fsx.exists && list.length) {
+      try {
+        const checks = await Promise.all(list.map(async (f) => {
+          try { return await MD.fsx.exists(f.path); } catch (e) { return true; }
+        }));
+        const kept = list.filter((f, i) => checks[i]);
+        if (kept.length !== list.length) {
+          S().recentFiles = kept;
+          MD.saveSettings();
+          list = kept;
+        }
+      } catch (e) { /* 忽略，保留原列表 */ }
+    }
+    list = list.slice(0, 12);
     if (!list.length) {
       box.innerHTML = '<div style="padding:8px 6px;color:var(--ui-muted);font-size:12px">暂无记录</div>';
       return;
@@ -143,7 +164,20 @@
       </div>
     `).join('');
     box.querySelectorAll('[data-file]').forEach((el) => {
-      el.addEventListener('click', () => MD.actions.openFile(el.dataset.file));
+      el.addEventListener('click', async () => {
+        const p = el.dataset.file;
+        // 点开前确认文件还在，已删除则从最近列表移除
+        if (MD.fsx.isApp && MD.fsx.exists) {
+          try {
+            if (!(await MD.fsx.exists(p))) {
+              removeRecent(p);
+              MD.toast('文件已不存在，已从最近打开移除');
+              return;
+            }
+          } catch (e) { /* 检查失败照常尝试打开 */ }
+        }
+        MD.actions.openFile(p);
+      });
     });
   }
 
@@ -167,22 +201,29 @@
     // 只取前 6 级、限制数量防卡
     const max = 400;
     box.innerHTML = items.slice(0, max).map((it, idx) => `
-      <div class="out-item out-l${U.clamp(it.level, 1, 6)}" data-line="${it.line}" data-idx="${idx}" title="${U.esc(it.text)}">${U.esc(it.text)}</div>
+      <div class="out-item out-l${U.clamp(it.level, 1, 6)}" data-line="${it.line}" data-idx="${idx}" data-text="${U.esc(it.text)}" title="${U.esc(it.text)}">${U.esc(it.text)}</div>
     `).join('') + (items.length > max ? `<div style="padding:6px;color:var(--ui-muted);font-size:11px">… 共 ${items.length} 个标题</div>` : '');
     box.querySelectorAll('.out-item').forEach((el) => {
       el.addEventListener('click', () => {
         const line = parseInt(el.dataset.line);
         const idx = parseInt(el.dataset.idx);
         MD.editor.scrollToLine(line);
-        jumpPreviewHeading(idx);
+        jumpPreviewHeading(el.dataset.text || '', idx);
       });
     });
   }
 
-  function jumpPreviewHeading(idx) {
+  function jumpPreviewHeading(text, idx) {
     const preview = U.$('#preview');
     const heads = U.$$('h1,h2,h3,h4,h5,h6', preview);
-    const target = heads[idx];
+    // 优先按标题文本匹配（大小写 / 空白归一化），避免只按「第 N 个标题」错位
+    const norm = (s) => String(s || '').toLowerCase().replace(/\s+/g, '');
+    let target = null;
+    if (text) {
+      const wanted = norm(text);
+      target = heads.find((h) => norm(h.textContent) === wanted);
+    }
+    if (!target) target = heads[idx];   // 兜底：仍按序号
     if (target) target.scrollIntoView({ block: 'start', behavior: 'smooth' });
   }
 

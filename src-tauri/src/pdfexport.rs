@@ -55,7 +55,8 @@ mod imp {
         settings
             .SetShouldPrintHeaderAndFooter(false)
             .map_err(|e| e.to_string())?;
-        // 主题背景（引用块底色、表格表头底色、代码块底色）要print出来
+        // 允许打印背景图形，但 print.css 会把正文 / 代码块 / 引用 / 表头强制成
+        // 白底黑字（打印友好），所以最终 PDF 不保留彩色主题配色。
         settings
             .SetShouldPrintBackgrounds(true)
             .map_err(|e| e.to_string())?;
@@ -117,10 +118,20 @@ mod imp {
             .map_err(|e| e.to_string())?;
         drop(tx2);
 
-        tauri::async_runtime::spawn_blocking(move || rx.recv_timeout(Duration::from_secs(180)))
+        // 回调没执行（channel 断开）和真正超时是两回事，别一律报「超时」
+        match tauri::async_runtime::spawn_blocking(move || rx.recv_timeout(Duration::from_secs(180)))
             .await
-            .map_err(|e| e.to_string())?
-            .map_err(|_| "PDF 导出超时（180 秒未完成）".to_string())?
+        {
+            Err(e) => Err(format!("PDF 导出任务异常终止：{}", e)),
+            Ok(Ok(Ok(()))) => Ok(()),
+            Ok(Ok(Err(e))) => Err(e),
+            Ok(Err(mpsc::RecvTimeoutError::Disconnected)) => {
+                Err("PDF 导出回调未执行（WebView 可能已关闭）".into())
+            }
+            Ok(Err(mpsc::RecvTimeoutError::Timeout)) => {
+                Err("PDF 导出超时（180 秒未完成）".into())
+            }
+        }
     }
 }
 

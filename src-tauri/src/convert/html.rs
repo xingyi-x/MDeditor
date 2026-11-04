@@ -32,7 +32,7 @@ fn detect_charset(bytes: &[u8]) -> Option<&'static encoding_rs::Encoding> {
     let rest = &lower[idx + 8..];
     let end = rest
         .find(|c: char| c == '"' || c == '\'' || c == '>' || c == ';' || c == ' ' || c == '/')
-        .unwrap_or(rest.len().min(20));
+        .unwrap_or_else(|| rest.char_indices().nth(20).map(|(i, _)| i).unwrap_or(rest.len()));
     let label = rest[..end].trim();
     if label.is_empty() {
         return None;
@@ -272,6 +272,19 @@ fn find_ci(s: &str, from: usize, pat: &str) -> Option<usize> {
     None
 }
 
+/// 给一段文本的每一行加 n 层 "> " 前缀；末尾空行不产生多余的空引用行
+fn prefix_lines(s: &str, n: usize) -> String {
+    let prefix = "> ".repeat(n);
+    let trimmed = s.trim_end_matches('\n');
+    let mut out = String::new();
+    for line in trimmed.split('\n') {
+        out.push_str(&prefix);
+        out.push_str(line);
+        out.push('\n');
+    }
+    out
+}
+
 /// 把 <table>...</table> 片段转成 Markdown 表格
 fn table_to_md(fragment: &str) -> String {
     let mut rows: Vec<Vec<String>> = Vec::new();
@@ -295,7 +308,15 @@ fn table_to_md(fragment: &str) -> String {
                 Some(v) => v,
                 None => break,
             };
-            let ce = find_ci(row, cs, "</td").or_else(|| find_ci(row, cs, "</th"));
+            // 结束标签取 </td 与 </th 里较近的一个，避免跨到下一个单元格的 </td>
+            let td_end = find_ci(row, cs, "</td");
+            let th_end = find_ci(row, cs, "</th");
+            let ce = match (td_end, th_end) {
+                (Some(a), Some(b)) => Some(a.min(b)),
+                (Some(a), None) => Some(a),
+                (None, Some(b)) => Some(b),
+                _ => None,
+            };
             let cell_end = ce.unwrap_or(row.len());
             let cell = &row[cs..cell_end];
             let gt = cell.find('>').map(|x| x + 1).unwrap_or(0);
@@ -317,18 +338,38 @@ fn table_to_md(fragment: &str) -> String {
     super::docx::render_table(rows)
 }
 
+struct ListCtx {
+    ordered: bool,
+    next: usize,
+}
+
 pub fn html_to_md(html: &str) -> String {
     let mut out = String::new();
+
+    // <title> 位于 <head> 内，而 head 会被整体跳过，所以先从原始文本单独提取标题
     let mut title: Option<String> = None;
+    if let Some(ts) = find_ci(html, 0, "<title") {
+        if let Some(gt) = html[ts..].find('>') {
+            let content_start = ts + gt + 1;
+            if let Some(te) = find_ci(html, content_start, "</title") {
+                let raw = &html[content_start..te];
+                let t = collapse_ws(&decode_entities(&strip_tags(raw)));
+                if !t.trim().is_empty() {
+                    title = Some(t.trim().to_string());
+                }
+            }
+        }
+    }
+
     let mut i = 0usize;
     let bytes = html.as_bytes();
 
     let mut skipping: Option<String> = None;
     let mut in_pre = false;
-    let mut in_title = false;
-    let mut list_depth = 0usize;
+    let mut list_stack: Vec<ListCtx> = Vec::new();
     let mut link_stack: Vec<String> = Vec::new();
     let mut quote_depth = 0usize;
+    let mut quote_spans: Vec<usize> = Vec::new();
 
     while i < html.len() {
         // <!DOCTYPE ...> / <![CDATA[...]]> 之类声明：整段跳过
@@ -355,7 +396,6 @@ pub fn html_to_md(html: &str) -> String {
                 if let Some(skip_name) = skipping.clone() {
                     if tag.closing && name == skip_name {
                         skipping = None;
-                        in_title = false;
                     }
                     continue;
                 }
@@ -368,14 +408,6 @@ pub fn html_to_md(html: &str) -> String {
                 }
                 if !tag.closing && name == "head" && !tag.selfclose {
                     skipping = Some("head".to_string());
-                    continue;
-                }
-                if name == "title" {
-                    if !tag.closing {
-                        in_title = true;
-                    } else {
-                        in_title = false;
-                    }
                     continue;
                 }
 
@@ -408,15 +440,24 @@ pub fn html_to_md(html: &str) -> String {
                     match name {
                         "h1" | "h2" | "h3" | "h4" | "h5" | "h6" => ensure_blank(&mut out),
                         "p" | "div" | "section" | "article" | "tr" | "table" | "ul" | "ol"
-                        | "blockquote" | "figure" | "figcaption" | "header" | "footer" | "main"
+                        | "figure" | "figcaption" | "header" | "footer" | "main"
                         | "nav" | "aside" | "dl" | "dd" | "dt" => {
                             if name == "ul" || name == "ol" {
-                                list_depth = list_depth.saturating_sub(1);
-                            }
-                            if name == "blockquote" {
-                                quote_depth = quote_depth.saturating_sub(1);
+                                list_stack.pop();
                             }
                             ensure_blank(&mut out);
+                        }
+                        "blockquote" => {
+                            // 本层内容逐行补一层 "> " 前缀（嵌套时逐层累加即等于 quote_depth）
+                            if let Some(start) = quote_spans.pop() {
+                                let frag = out[start..].to_string();
+                                out.truncate(start);
+                                out.push_str(&prefix_lines(&frag, 1));
+                            }
+                            quote_depth = quote_depth.saturating_sub(1);
+                            if quote_depth == 0 {
+                                ensure_blank(&mut out);
+                            }
                         }
                         "li" => ensure_line(&mut out),
                         "a" => {
@@ -452,17 +493,29 @@ pub fn html_to_md(html: &str) -> String {
                     | "header" | "footer" | "main" | "nav" | "aside" => ensure_blank(&mut out),
                     "li" => {
                         ensure_line(&mut out);
-                        let indent = "  ".repeat(list_depth.saturating_sub(1));
-                        out.push_str(&format!("{}- ", indent));
+                        let indent = "  ".repeat(list_stack.len().saturating_sub(1));
+                        let marker = match list_stack.last_mut() {
+                            Some(c) if c.ordered => {
+                                let n = c.next;
+                                c.next += 1;
+                                format!("{}. ", n)
+                            }
+                            _ => "- ".to_string(),
+                        };
+                        out.push_str(&format!("{}{}", indent, marker));
                     }
                     "ul" | "ol" => {
                         ensure_blank(&mut out);
-                        list_depth += 1;
+                        let start = attr_of(&tag.attrs, "start")
+                            .and_then(|s| s.trim().parse::<usize>().ok())
+                            .unwrap_or(1)
+                            .max(1);
+                        list_stack.push(ListCtx { ordered: name == "ol", next: start });
                     }
                     "blockquote" => {
                         ensure_blank(&mut out);
                         quote_depth += 1;
-                        out.push_str("> ");
+                        quote_spans.push(out.len());
                     }
                     "pre" => {
                         ensure_blank(&mut out);
@@ -510,9 +563,6 @@ pub fn html_to_md(html: &str) -> String {
             out.push_str(&decode_entities(raw));
         } else {
             let text = collapse_ws(&decode_entities(raw));
-            if in_title && title.is_none() && !text.trim().is_empty() {
-                title = Some(text.trim().to_string());
-            }
             if skipping.is_some() {
                 continue;
             }
@@ -525,6 +575,5 @@ pub fn html_to_md(html: &str) -> String {
             out = format!("# {}\n\n{}", t, out);
         }
     }
-    let _ = quote_depth;
     out
 }

@@ -45,7 +45,7 @@
     const p = await MD.fsx.pickFolder();
     if (!p) return;
     MD.panels.setFolder(p);
-    S().lastFolder = p;
+    MD.settings.lastFolder = p;
     MD.saveSettings();
     MD.toast('已打开文件夹');
   }
@@ -102,7 +102,11 @@
       MD.editor.value = text;
       MD.panels.pushRecent(path);
       if (!MD.panels.currentFolder && MD.fsx.isApp) {
-        MD.panels.setFolder(U.dirName(path));
+        const dir = U.dirName(path);
+        MD.panels.setFolder(dir);
+        // 自动设置文件夹时一并记住，供下次启动「恢复上次文件夹」
+        MD.settings.lastFolder = dir;
+        MD.saveSettings();
       }
       MD.bus.emit('doc:opened', path);
       markDirty(false);
@@ -114,12 +118,23 @@
   }
 
   /* ══════════ 保存 ══════════ */
+  /** 写盘期间文档是否没被再次改动：用 changeGeneration 快照 + isClean 比对 */
+  function isCleanSince(gen) {
+    const cm = MD.editor.cm;
+    return !gen || !!(cm && cm.isClean && cm.isClean(gen));
+  }
   async function save() {
     if (!state.currentFile) return saveAs();
+    const gen = MD.editor.cm && MD.editor.cm.changeGeneration ? MD.editor.cm.changeGeneration() : null;
     try {
       await MD.fsx.writeFile(state.currentFile, MD.editor.value);
-      MD.bus.emit('doc:saved');
-      MD.toast('已保存');
+      if (isCleanSince(gen)) {
+        MD.bus.emit('doc:saved');
+        MD.toast('已保存');
+      } else {
+        // 写盘期间又有输入：磁盘是旧快照，不能清脏，留给下一次自动保存补写
+        MD.toast('保存期间文档又有修改，已保留未保存状态');
+      }
     } catch (e) { MD.toast('保存失败：' + e.message); }
   }
   async function saveAs() {
@@ -128,14 +143,19 @@
       { name: 'Markdown', extensions: ['md', 'markdown'] },
     ]);
     if (!p) return;
+    const gen = MD.editor.cm && MD.editor.cm.changeGeneration ? MD.editor.cm.changeGeneration() : null;
     try {
       await MD.fsx.writeFile(p, MD.editor.value);
       state.currentFile = p;
       state.currentDir = U.dirName(p);
       MD.panels.pushRecent(p);
       MD.bus.emit('doc:opened', p);
-      MD.bus.emit('doc:saved');
-      MD.toast('已保存');
+      if (isCleanSince(gen)) {
+        MD.bus.emit('doc:saved');
+        MD.toast('已保存');
+      } else {
+        MD.toast('保存期间文档又有修改，已保留未保存状态');
+      }
     } catch (e) { MD.toast('保存失败：' + e.message); }
   }
   function closeDoc() {
@@ -334,18 +354,16 @@ ${wordMode ? wordPageCss() : pageCss}
 <html lang="zh-CN">
 <head>
 <meta charset="UTF-8">
-<meta name="author" content="行一">
-<meta name="generator" content="MDeditor">
-<meta name="description" content="由 MDeditor 导出；作者 行一，公众号「每天AI进步」">
+<meta name="Generator" content="MDeditor">
 <title>${U.esc(title)}</title>
-${wordMode ? '<meta name="ProgId" content="Word.Document"><meta name="Generator" content="Microsoft Word">' : ''}
+${wordMode ? '<meta name="ProgId" content="Word.Document">' : ''}
 <style>
 ${css}
 </style>
 </head>
 <body>
 ${wordMode ? '<div class="WordSection1">' : ''}<article class="markdown-body">${body}</article>${wordMode ? '</div>' : ''}
-${wordMode ? '' : `<div style="text-align:center;color:#9ca3af;font-size:12px;margin:30px 0">${U.esc(name)} · ${U.esc(now)}</div>`}
+${wordMode ? '' : `<div style="text-align:center;color:#9ca3af;font-size:12px;margin:30px 0">由 MDeditor 导出 · ${U.esc(now)}</div>`}
 </body>
 </html>`;
   }
@@ -553,12 +571,15 @@ ${wordMode ? '' : `<div style="text-align:center;color:#9ca3af;font-size:12px;ma
     // 画面放大会把内容挤出纸面，打印期间临时回到 100%，打印结束后恢复
     const zBefore = MD.zoom ? MD.zoom.get() : 100;
     if (zBefore !== 100) await MD.zoom.set(100, { silent: true, persist: false });
+    let zoomTimer = 0;
     const restoreZoom = () => {
+      // 兜底定时器与 afterprint 只允许生效一次，否则会覆盖用户之后改过的设置
+      clearTimeout(zoomTimer);
       window.removeEventListener('afterprint', restoreZoom);
       if (zBefore !== 100) MD.zoom.set(zBefore, { silent: true, persist: false });
     };
     window.addEventListener('afterprint', restoreZoom);
-    setTimeout(restoreZoom, 15000);
+    zoomTimer = setTimeout(restoreZoom, 15000);
 
     // 分页预览时纸面上的版式已经由 paged.js 排好，再叠加 @page 的页边距会导致
     // 每页被二次缩放/裁切，打印期间临时改成"无页边距、由内容自己决定"
@@ -567,12 +588,14 @@ ${wordMode ? '' : `<div style="text-align:center;color:#9ca3af;font-size:12px;ma
     const saved = pageStyle ? pageStyle.textContent : '';
     if (pagedOn) {
       pageStyle.textContent = '@page { size: auto; margin: 0; }';
+      let pageTimer = 0;
       const restore = () => {
+        clearTimeout(pageTimer);
         pageStyle.textContent = saved;
         window.removeEventListener('afterprint', restore);
       };
       window.addEventListener('afterprint', restore);
-      setTimeout(restore, 15000);
+      pageTimer = setTimeout(restore, 15000);
     }
     await MD.fsx.print();
   }

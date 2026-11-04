@@ -209,10 +209,7 @@
   </div>
 </div>
 
-<script>
-  // pagedjs 关闭自动执行，改为手动触发
-  window.PagedConfig = { auto: false };
-</script>
+<!-- PagedConfig 在 core.js 顶部设置；这里不放内联脚本，以便 CSP 用 script-src 'self' -->
 <script src="vendor/codemirror/codemirror.js"></script>
 <script src="vendor/codemirror/markdown.js"></script>
 <script src="vendor/codemirror/continuelist.js"></script>

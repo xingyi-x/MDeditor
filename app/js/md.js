@@ -250,14 +250,43 @@
 
   function slugCountReset() { for (const k of Object.keys(slugCount)) delete slugCount[k]; }
 
+  /* ── 任务列表：扫描源码，返回每个任务项所在的源码行号（0-based） ── */
+  // 前端给预览 checkbox 标 data-line、编辑器按行号回写，共用这一套扫描规则：
+  // 跳过 ``` / ~~~ 围栏（含缩进）内部的伪任务项，允许 > 引用、有序/无序列表前缀。
+  const TASK_LINE_RE = /^(\s*(?:>\s*)*(?:[-*+]|\d+[.)])\s+\[)([ xX])(\])/;
+  function taskLines(source) {
+    const out = [];
+    const fenceRe = /^\s*(`{3,}|~{3,})/;
+    let fence = null;
+    const lines = String(source || '').split('\n');
+    for (let i = 0; i < lines.length; i++) {
+      const fm = fenceRe.exec(lines[i]);
+      if (fm) {
+        const mark = fm[1][0];
+        if (!fence) fence = mark;
+        else if (fence === mark) fence = null;   // 同种围栏才闭合
+        continue;
+      }
+      if (fence) continue;
+      if (TASK_LINE_RE.test(lines[i])) out.push(i);
+    }
+    return out;
+  }
+
   /* ── 大纲：直接扫描源码行 ── */
   function parseOutline(source) {
     const out = [];
-    let inCode = false;
+    const fenceRe = /^\s*(`{3,}|~{3,})/;
+    let fence = null;
     source.split('\n').forEach((line, i) => {
-      const fence = /^\s*(```|~~~)/.exec(line);
-      if (fence) { inCode = !inCode; return; }
-      if (inCode) return;
+      const fm = fenceRe.exec(line);
+      if (fm) {
+        const mark = fm[1][0];
+        if (!fence) fence = mark;
+        else if (fence === mark) fence = null;   // 同种围栏才闭合，跳过围栏内的伪标题
+        return;
+      }
+      if (fence) return;
       const m = /^(#{1,6})\s+(.+?)\s*#*\s*$/.exec(line);
       if (m) {
         const text = m[2].replace(/[*`~]/g, '').trim();
@@ -267,5 +296,5 @@
     return out;
   }
 
-  MD.md = { render, parseOutline, postprocess, imgCache, refreshMermaidTheme };
+  MD.md = { render, parseOutline, taskLines, postprocess, imgCache, refreshMermaidTheme };
 })();

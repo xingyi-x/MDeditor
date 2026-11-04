@@ -72,26 +72,175 @@ fn stat_entry(p: &Path) -> Option<EntryInfo> {
 
 // ---------- 编码处理 ----------
 
-fn decode_bytes(bytes: &[u8]) -> String {
-    // UTF-8 BOM
-    if bytes.starts_with(&[0xEF, 0xBB, 0xBF]) {
-        return String::from_utf8_lossy(&bytes[3..]).into_owned();
+/// Tauri 2 里未标 async 的命令运行在主线程。PDF 转换、全文搜索、大图 base64、
+/// 注册表子进程都可能耗时数秒，主线程被占住时整个窗口「未响应」，连提示都刷不出来。
+/// 统一把这类同步工作挪到阻塞线程池。
+async fn on_worker<F, R>(f: F) -> Result<R, String>
+where
+    F: FnOnce() -> Result<R, String> + Send + 'static,
+    R: Send + 'static,
+{
+    tauri::async_runtime::spawn_blocking(f)
+        .await
+        .map_err(|e| format!("后台任务异常终止：{}", e))?
+}
+
+/// 写盘命令的路径守卫。不限制用户正常编辑的目录（否则会破坏另存为 / 粘贴图片），
+/// 只挡住 XSS 最典型的落点：把可执行文件写进「启动」文件夹。
+fn guarded_write_path(path: &str, check_ext: bool) -> Result<(), String> {
+    let norm = path.to_lowercase().replace('/', "\\");
+    if norm.contains("\\startup\\") || norm.contains("\\programs\\startup") {
+        return Err("不允许写入系统启动目录".into());
     }
-    // UTF-16 LE / BE BOM
+    if check_ext {
+        const BLOCKED: &[&str] = &[
+            "exe", "bat", "cmd", "ps1", "vbs", "vbe", "js", "jse", "wsf", "wsh", "scr", "dll",
+            "msi", "com", "pif", "hta", "reg", "lnk", "jar",
+        ];
+        let ext = Path::new(path)
+            .extension()
+            .map(|s| s.to_string_lossy().to_lowercase())
+            .unwrap_or_default();
+        if BLOCKED.contains(&ext.as_str()) {
+            return Err(format!("不允许写入可执行文件类型：.{}", ext));
+        }
+    }
+    Ok(())
+}
+
+fn detect_eol(bytes: &[u8]) -> String {
+    let crlf = bytes.windows(2).filter(|w| *w == b"\r\n").count();
+    let lf = bytes.iter().filter(|&&b| b == b'\n').count().saturating_sub(crlf);
+    let cr = bytes.iter().filter(|&&b| b == b'\r').count().saturating_sub(crlf);
+    if crlf >= lf && crlf >= cr {
+        "\r\n"
+    } else if cr > lf {
+        "\r"
+    } else {
+        "\n"
+    }
+    .to_string()
+}
+
+/// 读取时一并返回原编码、BOM 与换行风格，保存时按原样还原，
+/// 避免「打开 GBK/UTF-16 文件 → 静默改写成无 BOM UTF-8 + LF」。
+#[derive(Serialize, Clone)]
+struct TextFileInfo {
+    text: String,
+    encoding: String,
+    bom: bool,
+    eol: String,
+}
+
+fn decode_bytes_meta(bytes: &[u8]) -> (String, String, bool, String) {
+    let eol = detect_eol(bytes);
+    if bytes.starts_with(&[0xEF, 0xBB, 0xBF]) {
+        return (
+            String::from_utf8_lossy(&bytes[3..]).into_owned(),
+            "utf-8".into(),
+            true,
+            eol,
+        );
+    }
     if bytes.starts_with(&[0xFF, 0xFE]) {
         let (cow, _, _) = encoding_rs::UTF_16LE.decode(&bytes[2..]);
-        return cow.into_owned();
+        return (cow.into_owned(), "utf-16le".into(), true, eol);
     }
     if bytes.starts_with(&[0xFE, 0xFF]) {
         let (cow, _, _) = encoding_rs::UTF_16BE.decode(&bytes[2..]);
-        return cow.into_owned();
+        return (cow.into_owned(), "utf-16be".into(), true, eol);
     }
-    // 严格 UTF-8，失败则回退 GBK（中文环境常见）
     match std::str::from_utf8(bytes) {
-        Ok(s) => s.to_string(),
+        Ok(s) => (s.to_string(), "utf-8".into(), false, eol),
         Err(_) => {
-            let (cow, _, _) = encoding_rs::GBK.decode(bytes);
+            // 只在坏字节占比很高时才回退 GBK：一个偶然的坏字节不该让整篇 UTF-8
+            // 中文被当成 GBK 解成乱码，再被自动保存永久写回磁盘。
+            let mut bad = 0usize;
+            let mut i = 0usize;
+            while i < bytes.len() {
+                match std::str::from_utf8(&bytes[i..]) {
+                    Ok(_) => break,
+                    Err(e) => {
+                        i += e.valid_up_to();
+                        let skip = e.error_len().unwrap_or(1);
+                        bad += skip;
+                        i += skip;
+                    }
+                }
+            }
+            if bad * 20 <= bytes.len() {
+                (String::from_utf8_lossy(bytes).into_owned(), "utf-8".into(), false, eol)
+            } else {
+                let (cow, _, _) = encoding_rs::GBK.decode(bytes);
+                (cow.into_owned(), "gbk".into(), false, eol)
+            }
+        }
+    }
+}
+
+fn decode_bytes(bytes: &[u8]) -> String {
+    decode_bytes_meta(bytes).0
+}
+
+fn encode_text(content: &str, enc: &str, bom: bool, eol: &str) -> Result<Vec<u8>, String> {
+    let normalized = content
+        .replace("\r\n", "\n")
+        .replace('\r', "\n")
+        .replace('\n', eol);
+    let mut out: Vec<u8> = match enc {
+        "utf-16le" => {
+            let (cow, _, bad) = encoding_rs::UTF_16LE.encode(&normalized);
+            if bad {
+                return Err("当前内容包含 UTF-16LE 无法表示的字符".into());
+            }
             cow.into_owned()
+        }
+        "utf-16be" => {
+            let (cow, _, bad) = encoding_rs::UTF_16BE.encode(&normalized);
+            if bad {
+                return Err("当前内容包含 UTF-16BE 无法表示的字符".into());
+            }
+            cow.into_owned()
+        }
+        "gbk" => {
+            let (cow, _, bad) = encoding_rs::GBK.encode(&normalized);
+            if bad {
+                return Err("当前内容包含 GBK 无法表示的字符，请另存为 UTF-8".into());
+            }
+            cow.into_owned()
+        }
+        _ => normalized.into_bytes(),
+    };
+    if bom {
+        let prefix: &[u8] = match enc {
+            "utf-16le" => &[0xFF, 0xFE],
+            "utf-16be" => &[0xFE, 0xFF],
+            _ => &[0xEF, 0xBB, 0xBF],
+        };
+        let mut v = prefix.to_vec();
+        v.extend_from_slice(&out);
+        out = v;
+    }
+    Ok(out)
+}
+
+/// 原子写入：先写同目录的 .mdeditor-tmp，再 rename 覆盖。
+/// 崩溃或断电时不会留下半截文档；rename 失败时退回普通写入。
+fn atomic_write(path: &Path, data: &[u8]) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            fs::create_dir_all(parent)?;
+        }
+    }
+    let mut os = path.as_os_str().to_os_string();
+    os.push(".mdeditor-tmp");
+    let tmp = PathBuf::from(os);
+    fs::write(&tmp, data)?;
+    match fs::rename(&tmp, path) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            let _ = fs::remove_file(&tmp);
+            Err(e)
         }
     }
 }
@@ -99,57 +248,75 @@ fn decode_bytes(bytes: &[u8]) -> String {
 // ---------- 命令：文件读写 ----------
 
 #[tauri::command]
-fn read_text_file(path: String) -> Result<String, String> {
-    let bytes = fs::read(&path).map_err(to_string_err)?;
-    Ok(decode_bytes(&bytes))
+async fn read_text_file(path: String) -> Result<TextFileInfo, String> {
+    on_worker(move || {
+        let bytes = fs::read(&path).map_err(to_string_err)?;
+        let (text, encoding, bom, eol) = decode_bytes_meta(&bytes);
+        Ok(TextFileInfo { text, encoding, bom, eol })
+    })
+    .await
 }
 
 #[tauri::command]
-fn write_text_file(path: String, content: String) -> Result<(), String> {
-    if let Some(parent) = Path::new(&path).parent() {
-        if !parent.as_os_str().is_empty() {
-            let _ = fs::create_dir_all(parent);
-        }
-    }
-    fs::write(&path, content.as_bytes()).map_err(to_string_err)
+async fn write_text_file(
+    path: String,
+    content: String,
+    encoding: Option<String>,
+    bom: Option<bool>,
+    eol: Option<String>,
+) -> Result<(), String> {
+    on_worker(move || {
+        guarded_write_path(&path, false)?;
+        let enc = encoding.unwrap_or_else(|| "utf-8".into());
+        let has_bom = bom.unwrap_or(false);
+        let line_end = eol.filter(|s| s == "\n" || s == "\r\n" || s == "\r")
+            .unwrap_or_else(|| "\n".into());
+        let data = encode_text(&content, &enc, has_bom, &line_end)?;
+        atomic_write(Path::new(&path), &data).map_err(to_string_err)
+    })
+    .await
 }
 
 #[tauri::command]
-fn read_image_data_url(path: String) -> Result<String, String> {
-    let bytes = fs::read(&path).map_err(to_string_err)?;
-    let ext = Path::new(&path)
-        .extension()
-        .map(|s| s.to_string_lossy().to_lowercase())
-        .unwrap_or_default();
-    let mime = match ext.as_str() {
-        "png" => "image/png",
-        "jpg" | "jpeg" => "image/jpeg",
-        "gif" => "image/gif",
-        "webp" => "image/webp",
-        "bmp" => "image/bmp",
-        "svg" => "image/svg+xml",
-        "ico" => "image/x-icon",
-        "avif" => "image/avif",
-        _ => "application/octet-stream",
-    };
-    let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
-    Ok(format!("data:{};base64,{}", mime, b64))
+async fn read_image_data_url(path: String) -> Result<String, String> {
+    on_worker(move || {
+        let bytes = fs::read(&path).map_err(to_string_err)?;
+        let ext = Path::new(&path)
+            .extension()
+            .map(|s| s.to_string_lossy().to_lowercase())
+            .unwrap_or_default();
+        let mime = match ext.as_str() {
+            "png" => "image/png",
+            "jpg" | "jpeg" => "image/jpeg",
+            "gif" => "image/gif",
+            "webp" => "image/webp",
+            "bmp" => "image/bmp",
+            "svg" => "image/svg+xml",
+            "ico" => "image/x-icon",
+            "avif" => "image/avif",
+            _ => "application/octet-stream",
+        };
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+        Ok(format!("data:{};base64,{}", mime, b64))
+    })
+    .await
 }
 
 #[tauri::command]
-fn write_base64_file(path: String, data: String) -> Result<(), String> {
-    // 兼容 data:image/png;base64,xxxx 形式
-    let payload = match data.split_once(",") {
-        Some((head, rest)) if head.contains("base64") => rest.to_string(),
-        _ => data,
-    };
-    let bytes = base64::engine::general_purpose::STANDARD
-        .decode(payload.trim())
-        .map_err(to_string_err)?;
-    if let Some(parent) = Path::new(&path).parent() {
-        let _ = fs::create_dir_all(parent);
-    }
-    fs::write(&path, bytes).map_err(to_string_err)
+async fn write_base64_file(path: String, data: String) -> Result<(), String> {
+    on_worker(move || {
+        guarded_write_path(&path, true)?;
+        // 兼容 data:image/png;base64,xxxx 形式
+        let payload = match data.split_once(",") {
+            Some((head, rest)) if head.contains("base64") => rest.to_string(),
+            _ => data,
+        };
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(payload.trim())
+            .map_err(to_string_err)?;
+        atomic_write(Path::new(&path), &bytes).map_err(to_string_err)
+    })
+    .await
 }
 
 // ---------- 命令：目录 ----------
@@ -188,6 +355,7 @@ fn create_dir(path: String) -> Result<(), String> {
 
 #[tauri::command]
 fn remove_path(path: String) -> Result<(), String> {
+    guarded_write_path(&path, false)?;
     let p = Path::new(&path);
     if p.is_dir() {
         fs::remove_dir_all(p).map_err(to_string_err)
@@ -227,7 +395,11 @@ fn is_junk_dir(name: &str) -> bool {
 }
 
 #[tauri::command]
-fn find_markdown_files(root: String, max_depth: u32) -> Result<Vec<EntryInfo>, String> {
+async fn find_markdown_files(root: String, max_depth: u32) -> Result<Vec<EntryInfo>, String> {
+    on_worker(move || find_markdown_files_sync(root, max_depth)).await
+}
+
+fn find_markdown_files_sync(root: String, max_depth: u32) -> Result<Vec<EntryInfo>, String> {
     let mut out: Vec<EntryInfo> = Vec::new();
     fn walk(dir: &Path, depth: u32, max_depth: u32, out: &mut Vec<EntryInfo>) {
         if depth > max_depth || out.len() > 5000 {
@@ -268,7 +440,16 @@ fn find_markdown_files(root: String, max_depth: u32) -> Result<Vec<EntryInfo>, S
 // ---------- 命令：全文搜索 ----------
 
 #[tauri::command]
-fn search_in_files(
+async fn search_in_files(
+    root: String,
+    query: String,
+    case_sensitive: bool,
+    max_hits: u32,
+) -> Result<Vec<SearchHit>, String> {
+    on_worker(move || search_in_files_sync(root, query, case_sensitive, max_hits)).await
+}
+
+fn search_in_files_sync(
     root: String,
     query: String,
     case_sensitive: bool,
@@ -334,11 +515,17 @@ fn search_in_files(
                     line.to_lowercase().contains(needle_lower)
                 };
                 if found {
-                    let col = if case_sensitive {
-                        line.find(query).map(|c| c as u64).unwrap_or(0)
+                    // column 给前端展示用，必须按**字符数**算；str::find 返回的是字节偏移，
+                    // 中文行会偏大。to_lowercase 可能改变字节长度，切片要防越界。
+                    let byte_col = if case_sensitive {
+                        line.find(query).unwrap_or(0)
                     } else {
-                        line.to_lowercase().find(needle_lower).map(|c| c as u64).unwrap_or(0)
+                        line.to_lowercase().find(needle_lower).unwrap_or(0)
                     };
+                    let col = line
+                        .get(..byte_col)
+                        .map(|s| s.chars().count() as u64)
+                        .unwrap_or(0);
                     hits.push(SearchHit {
                         path: p.to_string_lossy().into_owned(),
                         name: name.clone(),
@@ -394,7 +581,11 @@ fn reveal_in_explorer(path: String) -> Result<(), String> {
 }
 
 #[tauri::command]
-fn open_with_default_app(path: String) -> Result<(), String> {
+async fn open_with_default_app(path: String) -> Result<(), String> {
+    on_worker(move || open_with_default_app_sync(path)).await
+}
+
+fn open_with_default_app_sync(path: String) -> Result<(), String> {
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
@@ -415,10 +606,22 @@ fn open_with_default_app(path: String) -> Result<(), String> {
                 return Err(format!("文件不存在：{}", path));
             }
         }
-        // 整体加引号：cmd 只在引号外识别命令分隔符
-        let arg = format!("\"{}\"", path);
+        // cmd 会在引号内展开 %VAR%（启用延迟展开时还有 !VAR!），
+        // 含这些字符的路径改走 explorer，完全不经过命令行解释器。
+        if path.contains('%') || path.contains('!') {
+            std::process::Command::new("explorer.exe")
+                .arg(&path)
+                .creation_flags(CREATE_NO_WINDOW)
+                .spawn()
+                .map_err(to_string_err)?;
+            return Ok(());
+        }
+        // 旧实现先手工加引号再交给 .args()：Rust 会把参数里的 " 转义成 \"，
+        // cmd.exe 不认识 \"，含空格路径的引号配对会错位。
+        // raw_arg 把整段尾部命令原样追加，引号由我们自己控制。
+        let tail = format!("/C start \"\" \"{}\"", path);
         std::process::Command::new("cmd")
-            .args(["/C", "start", "", &arg])
+            .raw_arg(tail)
             .creation_flags(CREATE_NO_WINDOW)
             .spawn()
             .map_err(to_string_err)?;
@@ -444,28 +647,32 @@ fn get_pdf_target(state: tauri::State<AppState>) -> Option<String> {
 }
 
 #[tauri::command]
-fn quit_app(app: tauri::AppHandle) {
-    app.exit(0);
+fn quit_app(app: tauri::AppHandle, code: Option<i32>) {
+    // --pdf-out 自动化导出用退出码告诉批处理脚本成功/失败
+    app.exit(code.unwrap_or(0));
 }
 
 // ---------- 命令：文档 → Markdown ----------
 
 #[tauri::command]
-fn convert_to_md(
+async fn convert_to_md(
     input: String,
     output: String,
     images: bool,
     front_matter: bool,
     overwrite: bool,
 ) -> Result<String, String> {
-    let opts = convert::Options { images, front_matter };
-    let (path, _) = convert::convert_and_write(
-        Path::new(&input),
-        Path::new(&output),
-        &opts,
-        overwrite,
-    )?;
-    Ok(path.to_string_lossy().into_owned())
+    on_worker(move || {
+        let opts = convert::Options { images, front_matter };
+        let (path, _) = convert::convert_and_write(
+            Path::new(&input),
+            Path::new(&output),
+            &opts,
+            overwrite,
+        )?;
+        Ok(path.to_string_lossy().into_owned())
+    })
+    .await
 }
 
 #[tauri::command]
@@ -571,8 +778,13 @@ fn write_reg(entries: &[RegEntry]) -> Result<(), String> {
         // 默认值仍是空的，文件关联等于没写。
         let mut ps = String::from("$ErrorActionPreference='Stop';");
         for e in entries {
-            let path = format!("HKEY_CURRENT_USER\\{}", e.key.trim_start_matches("HKCU\\"));
-            let path = path.replace('\'', "''");
+            // CurrentUser.CreateSubKey 接收的是**相对 HKCU 的子键路径**，
+            // 再拼上 "HKEY_CURRENT_USER\" 会真的创建 HKCU\HKEY_CURRENT_USER\…，
+            // 兜底分支看似成功、关联实际没写进去。
+            let path = e.key
+                .trim_start_matches("HKCU\\")
+                .trim_start_matches("HKEY_CURRENT_USER\\")
+                .replace('\'', "''");
             ps.push_str(&format!(
                 "$k=[Microsoft.Win32.Registry]::CurrentUser.CreateSubKey('{}');",
                 path
@@ -617,7 +829,11 @@ fn write_reg(entries: &[RegEntry]) -> Result<(), String> {
 /// 在当前用户下注册：Applications\MDeditor.exe + ProgID + OpenWithProgids。
 /// 不需要管理员权限，注册后 MDeditor 会出现在「打开方式」/「其他应用」列表里。
 #[tauri::command]
-fn register_md_assoc() -> Result<String, String> {
+async fn register_md_assoc() -> Result<String, String> {
+    on_worker(register_md_assoc_sync).await
+}
+
+fn register_md_assoc_sync() -> Result<String, String> {
     #[cfg(not(target_os = "windows"))]
     {
         return Err("仅 Windows 支持".into());
@@ -677,13 +893,15 @@ fn register_md_assoc() -> Result<String, String> {
 
 /// 关联状态：已注册返回 true
 #[tauri::command]
-fn md_assoc_status() -> bool {
-    #[cfg(not(target_os = "windows"))]
-    {
-        false
-    }
+async fn md_assoc_status() -> bool {
+    on_worker(|| Ok(md_assoc_status_sync())).await.unwrap_or(false)
+}
+
+fn md_assoc_status_sync() -> bool {
     #[cfg(target_os = "windows")]
     {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x08000000;
         // 三条路径任一命中即视为已关联：
         // ① 设置页按钮写入的 Applications 键 ② 设置页写入的 ProgID
         // ③ 安装包 APP_ASSOCIATE 写入的 ProgID（中文名，installer.nsi 里就是它）
@@ -693,22 +911,30 @@ fn md_assoc_status() -> bool {
             r"HKCU\Software\Classes\Markdown 文档\shell\open\command",
         ];
         for key in keys {
-            if let Ok(o) = std::process::Command::new("reg").args(["query", key]).output() {
+            // 不隐藏窗口的话，每次打开「设置」都会闪一个黑色控制台
+            if let Ok(o) = std::process::Command::new("reg")
+                .args(["query", key])
+                .creation_flags(CREATE_NO_WINDOW)
+                .output()
+            {
                 if o.status.success() {
                     return true;
                 }
             }
         }
         // reg.exe 被策略拦掉时再试 PowerShell（只查一条，够用）
-        let ps = format!(
-            "Test-Path 'Microsoft.PowerShell.Core\\Registry::HKEY_CURRENT_USER\\Software\\Classes\\Applications\\MDeditor.exe\\shell\\open\\command'"
-        );
+        let ps = "Test-Path 'Microsoft.PowerShell.Core\\Registry::HKEY_CURRENT_USER\\Software\\Classes\\Applications\\MDeditor.exe\\shell\\open\\command'";
         if let Ok(o) = std::process::Command::new("powershell")
-            .args(["-NoProfile", "-NonInteractive", "-Command", &ps])
+            .args(["-NoProfile", "-NonInteractive", "-Command", ps])
+            .creation_flags(CREATE_NO_WINDOW)
             .output()
         {
             return String::from_utf8_lossy(&o.stdout).trim() == "True";
         }
+        false
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
         false
     }
 }
@@ -748,20 +974,26 @@ fn main() {
         .skip(1)
         .map(|a| a.to_string_lossy().into_owned())
         .collect();
-    let startup_file = args
-        .iter()
-        .find(|a| !a.starts_with('-') && Path::new(a).is_file())
-        .cloned();
-
     // --pdf-out <路径> 或 --pdf-out=<路径>：无界面交互地把文档导出成 PDF
-    let pdf_out = args
+    let pdf_value = args
         .iter()
         .position(|a| a == "--pdf-out")
-        .and_then(|i| args.get(i + 1).cloned())
-        .or_else(|| {
-            args.iter()
-                .find_map(|a| a.strip_prefix("--pdf-out=").map(|s| s.to_string()))
-        });
+        .and_then(|i| args.get(i + 1).cloned());
+    let pdf_out = pdf_value.clone().or_else(|| {
+        args.iter()
+            .find_map(|a| a.strip_prefix("--pdf-out=").map(|s| s.to_string()))
+    });
+
+    // `mdeditor.exe --pdf-out out.pdf in.md` 里的 out.pdf 也是个存在的路径，
+    // 但它是**输出**而不是要打开的文档，必须排除，否则启动后先打开一个 PDF。
+    let startup_file = args
+        .iter()
+        .find(|a| {
+            !a.starts_with('-')
+                && pdf_value.as_deref() != Some(a.as_str())
+                && Path::new(a).is_file()
+        })
+        .cloned();
 
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())

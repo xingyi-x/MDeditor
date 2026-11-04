@@ -21,6 +21,11 @@
     } catch (e) {
       console.error(e);
     }
+    // 给预览里的任务勾选框标上源码行号，点击时按行精确回写（与编辑器共用扫描规则）
+    const taskLineNos = MD.md.taskLines(text);
+    U.$$('input[data-task]', preview).forEach((cb, i) => {
+      if (taskLineNos[i] != null) cb.dataset.line = taskLineNos[i];
+    });
     if (seq !== renderSeq) return; // 已有更新请求
     updateCounts(text);
     MD.bus.emit('render:done');
@@ -291,6 +296,15 @@
     const cur = m ? m[1].length : 0;
     MD.editor.actions.heading(cur >= 3 ? 0 : cur + 1);
   }
+  /** 判断 p 是否位于 dir 目录内：目录末尾补分隔符、Windows 大小写不敏感、必须严格长于前缀 */
+  function isUnderDir(p, dir) {
+    if (!p || !dir) return false;
+    const sep = MD.fsx.sep || '/';
+    const prefix = /[\\/]$/.test(dir) ? dir : dir + sep;
+    if (p.length <= prefix.length) return false;
+    const head = p.slice(0, prefix.length);
+    return sep === '\\' ? head.toLowerCase() === prefix.toLowerCase() : head === prefix;
+  }
   async function pickAndInsertImage() {
     const p = await MD.fsx.pickFile([
       { name: '图片', extensions: ['png', 'jpg', 'jpeg', 'gif', 'webp', 'bmp', 'svg'] },
@@ -298,7 +312,7 @@
     if (!p) return;
     const name = U.baseName(p);
     // 若图片与文档同目录，用相对路径；否则内嵌
-    if (state.currentDir && p.startsWith(state.currentDir)) {
+    if (isUnderDir(p, state.currentDir)) {
       const rel = p.slice(state.currentDir.length).replace(/^[\\/]+/, '');
       MD.editor.actions.imageLink(rel.replace(/\\/g, '/'), name);
     } else {
@@ -319,17 +333,21 @@
   function bindKeys() {
     document.addEventListener('keydown', (e) => {
       const mod = e.ctrlKey || e.metaKey;
-      if (mod && e.key === 's') { e.preventDefault(); MD.actions.save(); }
-      else if (mod && e.key === 'n') { e.preventDefault(); MD.actions.newFile(); }
-      else if (mod && e.key === 'o' && e.shiftKey) { e.preventDefault(); MD.actions.openFolderDialog(); }
-      else if (mod && e.altKey && e.key.toLowerCase() === 'o') { e.preventDefault(); MD.actions.importAsMarkdown(); }
-      else if (mod && e.key === 'o') { e.preventDefault(); MD.actions.openFileDialog(); }
-      else if (mod && e.key === 'p') { e.preventDefault(); MD.actions.exportPDF(); }
+      // 按住 Shift 时 e.key 会是大写（'S'/'O'），统一小写后再判断
+      const k = (e.key || '').toLowerCase();
+      // shift 分支必须排在普通 s/o/p 之前
+      if (mod && e.shiftKey && k === 's') { e.preventDefault(); MD.actions.saveAs(); }
+      else if (mod && e.shiftKey && k === 'o') { e.preventDefault(); MD.actions.openFolderDialog(); }
+      else if (mod && e.altKey && k === 'o') { e.preventDefault(); MD.actions.importAsMarkdown(); }
+      else if (mod && k === 's') { e.preventDefault(); MD.actions.save(); }
+      else if (mod && k === 'n') { e.preventDefault(); MD.actions.newFile(); }
+      else if (mod && k === 'o') { e.preventDefault(); MD.actions.openFileDialog(); }
+      else if (mod && k === 'p') { e.preventDefault(); MD.actions.exportPDF(); }
       else if (mod && e.key === '\\') { e.preventDefault(); toggleSidebar(); }
-      else if (e.altKey && e.key === '1') { e.preventDefault(); setView('source'); }
-      else if (e.altKey && e.key === '2') { e.preventDefault(); setView('split'); }
-      else if (e.altKey && e.key === '3') { e.preventDefault(); setView('preview'); }
-      else if (e.altKey && e.key === '4') { e.preventDefault(); setView('read'); }
+      else if (e.altKey && k === '1') { e.preventDefault(); setView('source'); }
+      else if (e.altKey && k === '2') { e.preventDefault(); setView('split'); }
+      else if (e.altKey && k === '3') { e.preventDefault(); setView('preview'); }
+      else if (e.altKey && k === '4') { e.preventDefault(); setView('read'); }
       else if (e.key === 'F11') { e.preventDefault(); toggleFullscreen(); }
       else if (e.key === 'Escape') {
         closeMenus();
@@ -353,7 +371,16 @@
         if (a.dataset.external) {
           MD.fsx.openExternal(href);
         } else if (href.startsWith('#')) {
-          const t = U.$('#preview ' + CSS.escape(href));
+          const id = decodeURIComponent(href.slice(1));
+          const el = document.getElementById(id);
+          let t = el && U.$('#preview').contains(el) ? el : null;
+          if (!t) {
+            // marked 生成的 heading id 通常是「小写、空格换 -、去标点」，
+            // 这里在 #preview 内遍历 [id]，按大小写/字符归一化兜底比对（保留中文）
+            const norm = (s) => String(s || '').toLowerCase().replace(/[^a-z0-9\u4e00-\u9fff]+/g, '');
+            const wanted = norm(id);
+            t = U.$$('[id]', U.$('#preview')).find((n) => norm(n.id) === wanted) || null;
+          }
           if (t) t.scrollIntoView({ behavior: 'smooth', block: 'start' });
         } else if (a.dataset.mdLink) {
           // 相对链接 → 打开同级 md 文件
@@ -369,9 +396,15 @@
       // 任务列表勾选
       const cb = e.target.closest('input[data-task]');
       if (cb) {
-        const boxes = U.$$('input[data-task]', U.$('#preview'));
-        const idx = boxes.indexOf(cb);
-        MD.editor.setTaskByIndex(idx, cb.checked);
+        // 渲染时已标上源码行号，优先按行回写；没有 data-line 时回退按序号
+        const line = cb.dataset.line;
+        if (line != null && line !== '') {
+          MD.editor.setTaskByLine(parseInt(line, 10), cb.checked);
+        } else {
+          const boxes = U.$$('input[data-task]', U.$('#preview'));
+          const idx = boxes.indexOf(cb);
+          MD.editor.setTaskByIndex(idx, cb.checked);
+        }
         return;
       }
       // 点击预览跳到源码对应位置（分栏时）
@@ -513,8 +546,18 @@
   let _autoSaveFailed = false;
   const autoSave = U.debounce(() => {
     if (MD.settings.autoSave && state.currentFile && state.dirty) {
+      const gen = MD.editor.cm && MD.editor.cm.changeGeneration ? MD.editor.cm.changeGeneration() : null;
       MD.fsx.writeFile(state.currentFile, MD.editor.value)
-        .then(() => { _autoSaveFailed = false; MD.bus.emit('doc:saved'); })
+        .then(() => {
+          _autoSaveFailed = false;
+          const cm = MD.editor.cm;
+          // 写盘期间又改过：磁盘是旧快照，不清脏，留给下一次自动保存补写
+          if (!gen || (cm && cm.isClean && cm.isClean(gen))) {
+            MD.bus.emit('doc:saved');
+          } else {
+            MD.toast('保存期间文档又有修改，已保留未保存状态');
+          }
+        })
         .catch((e) => {
           // 不要静默失败：文件只读/被占用时用户必须知道内容没写进磁盘
           if (!_autoSaveFailed) {
@@ -575,7 +618,35 @@
     MD.bus.on('render:needed', renderNow);
     MD.bus.emit('theme:applied');
 
+    // 关闭拦截：WebView2 里 beforeunload 不可靠，优先用 Tauri 的 onCloseRequested。
+    // 若运行时拿不到该 API，只能退回 beforeunload，此时 Rust 侧需拦截 CloseRequested 才能兜住。
+    let nativeCloseGuard = false;
+    try {
+      const T = window.__TAURI__ || {};
+      const win = T.window && T.window.getCurrentWindow
+        ? T.window.getCurrentWindow()
+        : (T.webviewWindow && T.webviewWindow.getCurrentWebviewWindow
+          ? T.webviewWindow.getCurrentWebviewWindow() : null);
+      if (win && typeof win.onCloseRequested === 'function') {
+        // 注册本身是异步的，不阻塞启动；成功后才让 beforeunload 让位
+        Promise.resolve(win.onCloseRequested(async (event) => {
+          if (!state.dirty) return;
+          event.preventDefault();
+          if (confirm('当前文档有未保存的修改，是否保存后关闭？')) {
+            await MD.actions.save();
+            // 保存失败时 dirty 仍为 true，不能静默退出丢内容
+            if (!state.dirty) await MD.fsx.quit();
+          } else if (confirm('放弃未保存的修改并关闭吗？')) {
+            await MD.fsx.quit();
+          }
+          // 两个都选「否」：取消本次关闭
+        })).then(() => { nativeCloseGuard = true; })
+          .catch((e) => console.warn('关闭拦截注册失败', e));
+      }
+    } catch (e) { console.warn('关闭拦截注册失败', e); }
+
     window.addEventListener('beforeunload', (e) => {
+      if (nativeCloseGuard) return;   // 已由原生拦截接管，避免重复提示
       if (state.dirty) { e.preventDefault(); e.returnValue = ''; }
     });
 
@@ -583,6 +654,9 @@
     const startup = await MD.fsx.startupFile();
     if (startup && U.isMarkdown(startup)) {
       await MD.actions.openFile(startup);
+    } else if (startup) {
+      // 非 Markdown 的启动参数不再静默忽略：转成 .md 后打开
+      await MD.actions.importFile(startup);
     } else {
       // 恢复上次文件夹
       if (s.lastFolder) {
@@ -603,20 +677,44 @@
     maybeAutoExportPdf();
   }
 
+  /** 等一次渲染真正完成；Mermaid 图多时固定 900ms 往往还没画完 */
+  function waitForRenderDone(maxMs) {
+    return new Promise((resolve) => {
+      let settled = false;
+      let timer = null;
+      function finish() {
+        if (settled) return;
+        settled = true;
+        MD.bus.off('render:done', onDone);
+        if (timer) clearTimeout(timer);
+        resolve();
+      }
+      function onDone() {
+        // render:done 之后 Mermaid / KaTeX 仍可能异步收尾，再让两帧
+        requestAnimationFrame(() => requestAnimationFrame(finish));
+      }
+      MD.bus.on('render:done', onDone);
+      timer = setTimeout(finish, maxMs);
+    });
+  }
+
   async function maybeAutoExportPdf() {
     if (!MD.fsx.isApp) return;
     let target = null;
     try { target = await MD.fsx.pdfTarget(); } catch (e) { return; }
     if (!target) return;
+    let code = 1;
     try {
-      // 等字体、KaTeX、Mermaid 画完，否则 PDF 里公式是空白
-      await new Promise((r) => setTimeout(r, 900));
+      // 等字体、KaTeX、Mermaid 画完，否则 PDF 里公式是空白；最多等 8 秒
+      await waitForRenderDone(8000);
       const ok = await MD.actions.exportPDFTo(target, { silent: true });
+      code = ok ? 0 : 1;
       console.log(ok ? 'pdf-export-ok ' + target : 'pdf-export-failed ' + target);
     } catch (e) {
       console.error('自动导出 PDF 失败', e);
     } finally {
-      setTimeout(() => { MD.fsx.quit(); }, 500);
+      // 批处理脚本靠退出码判断是否成功，不能恒为 0
+      setTimeout(() => { MD.fsx.quit(code); }, 500);
     }
   }
 

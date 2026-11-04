@@ -23,12 +23,15 @@ pub fn convert(data: &[u8]) -> Result<String, String> {
             Some(x) => x,
             None => continue,
         };
-        let grid = parse_sheet(&xml, &shared);
+        let (grid, truncated) = parse_sheet(&xml, &shared);
         if grid.is_empty() {
             continue;
         }
         out.push_str(&format!("# {}\n\n", name));
         out.push_str(&super::docx::render_table(grid));
+        if truncated {
+            out.push_str(&format!("> … 已截断，仅显示前 {} 行\n", MAX_ROWS));
+        }
         out.push('\n');
     }
     if out.trim().is_empty() {
@@ -161,6 +164,8 @@ fn col_of(cell_ref: &str) -> usize {
 }
 
 fn clean_number(s: &str) -> String {
+    // 说明：日期序列号 → 日期需要解析 styles.xml 的 numFmt 并处理 1900/1904 两套日期系统与
+    // 1900 闰年兼容，成本不低且易出错；此处按「低成本做不到」跳过，仍按数字原样输出。
     let t = s.trim();
     if t.is_empty() {
         return String::new();
@@ -173,7 +178,8 @@ fn clean_number(s: &str) -> String {
     t.to_string()
 }
 
-fn parse_sheet(xml: &str, shared: &[String]) -> Vec<Vec<String>> {
+/// 返回 (表格行, 是否因 MAX_ROWS 被截断)
+fn parse_sheet(xml: &str, shared: &[String]) -> (Vec<Vec<String>>, bool) {
     let mut r = Reader::from_str(xml);
     r.config_mut().trim_text(false);
     let mut buf = Vec::new();
@@ -186,13 +192,26 @@ fn parse_sheet(xml: &str, shared: &[String]) -> Vec<Vec<String>> {
     let mut in_v = false;
     let mut in_is = false;
     let mut in_t = false;
+    let mut truncated = false;
+    let mut at_limit = false;
 
     loop {
         match r.read_event_into(&mut buf) {
             Ok(Event::Eof) => break,
             Ok(Event::Start(e)) => match e.local_name().as_ref() {
                 b"row" => {
+                    // 已到行数上限又遇到新行：确认被截断（正好 2000 行时不会误报）
+                    if at_limit {
+                        truncated = true;
+                        break;
+                    }
                     cur = Vec::new();
+                    // 按 <row r="N"> 补齐中间被省略的空行，尽量还原原始行距
+                    if let Some(n) = super::xml_attr(&e, "r").and_then(|s| s.parse::<usize>().ok()) {
+                        while rows.len() < n.saturating_sub(1) && rows.len() < MAX_ROWS {
+                            rows.push(Vec::new());
+                        }
+                    }
                 }
                 b"c" => {
                     cell_type = super::xml_attr(&e, "t").unwrap_or_default();
@@ -213,7 +232,7 @@ fn parse_sheet(xml: &str, shared: &[String]) -> Vec<Vec<String>> {
                         rows.push(std::mem::take(&mut cur));
                     }
                     if rows.len() >= MAX_ROWS {
-                        break;
+                        at_limit = true;
                     }
                 }
                 b"c" => {
@@ -260,7 +279,7 @@ fn parse_sheet(xml: &str, shared: &[String]) -> Vec<Vec<String>> {
         buf.clear();
     }
 
-    // 去掉尾部全空的行与列
+    // 去掉尾部全空的行与列（中间按 row r 补出来的空行不会被当尾部删掉）
     while rows.last().map(|r| r.iter().all(|c| c.is_empty())).unwrap_or(false) {
         rows.pop();
     }
@@ -282,5 +301,5 @@ fn parse_sheet(xml: &str, shared: &[String]) -> Vec<Vec<String>> {
             }
         }
     }
-    rows
+    (rows, truncated)
 }

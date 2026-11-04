@@ -70,6 +70,9 @@ struct Dev {
     last_end: f64,
     last_y: f64,
     first_char: bool,
+    /// 只有显式设置 MD_PDF_TRACE 时才逐字符收集调试信息；
+    /// release 版正常转换不应为每个字符构造字符串
+    trace_on: bool,
     trace: Vec<String>,
 }
 
@@ -129,6 +132,7 @@ impl Dev {
             last_end: f64::MAX,
             last_y: 0.0,
             first_char: false,
+            trace_on: std::env::var("MD_PDF_TRACE").is_ok(),
             trace: Vec::new(),
         }
     }
@@ -245,7 +249,7 @@ impl OutputDev for Dev {
         };
         let rot = self.rotations.get(&self.page).copied().unwrap_or(0);
         let (x, y) = map_point(trm.m31, trm.m32, rot, self.page_w, self.page_h);
-        if self.trace.len() < 4000 {
+        if self.trace_on && self.trace.len() < 4000 {
             self.trace.push(format!(
                 "x={:.2} y={:.2} w={:.4} tfs={:.2} end={:.2} ch={:?}",
                 x, y, width, tfs, self.last_end, char
@@ -819,14 +823,41 @@ fn is_delim(b: u8) -> bool {
 
 /* ────────── 主入口 ────────── */
 
+/* 全局 panic hook 只安装一次，用 thread-local 标志控制「本次转换是否静音」。
+ * 早期实现每次转换都 take_hook/set_hook，属于进程级全局状态：并发转换时
+ * 一个线程会把另一个线程的 panic 一起吞掉，两次转换交错还会让 hook 永久静音。
+ * 现在只有当前线程在转换期间静音，其它线程的 panic 照常向 stderr 报告。 */
+static PANIC_HOOK_ONCE: std::sync::Once = std::sync::Once::new();
+thread_local! {
+    static QUIET_PANIC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+fn install_panic_hook() {
+    PANIC_HOOK_ONCE.call_once(|| {
+        let prev = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            let quiet = QUIET_PANIC.try_with(|c| c.get()).unwrap_or(false);
+            if !quiet {
+                prev(info);
+            }
+        }));
+    });
+}
+
 pub fn convert(data: &[u8], ctx: &Ctx) -> Result<String, String> {
     let mut doc = Document::load_mem(data).map_err(|e| format!("PDF 解析失败：{}", e))?;
     if doc.is_encrypted() {
         let _ = doc.decrypt("");
     }
 
-    // lopdf 只用来拿 /Rotate、图片位置与图片本体
-    let ldoc = lopdf::Document::load_mem(data).ok();
+    // lopdf 只用来拿 /Rotate、图片位置与图片本体。
+    // 加密 PDF 也必须解密，否则读到的流仍是密文，图片会静默缺失。
+    let mut ldoc = lopdf::Document::load_mem(data).ok();
+    if let Some(d) = ldoc.as_mut() {
+        if d.is_encrypted() {
+            let _ = d.decrypt("");
+        }
+    }
     let meta = ldoc.as_ref().map(scan_pages).unwrap_or_default();
 
     let mut dev = Dev::new(meta.rotations.clone());
@@ -835,12 +866,12 @@ pub fn convert(data: &[u8], ctx: &Ctx) -> Result<String, String> {
      * 这些都不是我们能把控的，但**不能让一张坏页把整个转换进程带崩**：
      * 包一层 catch_unwind，panic 后保留已经解析出来的内容，至少还能出半成品。
      * 注意：这条路径要求 release 不开 panic=abort，否则 catch_unwind 无效（进程直接 abort）。 */
-    let prev_hook = std::panic::take_hook();
-    std::panic::set_hook(Box::new(|_| {}));
+    install_panic_hook();
+    QUIET_PANIC.with(|c| c.set(true));
     let extracted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         output_doc(&doc, &mut dev)
     }));
-    std::panic::set_hook(prev_hook);
+    QUIET_PANIC.with(|c| c.set(false));
 
     match extracted {
         Ok(Ok(())) => {}
@@ -993,29 +1024,57 @@ fn color_spec(doc: &lopdf::Document, dict: &lopdf::Dictionary) -> Option<Spec> {
     }
 }
 
-fn predictor_of(dict: &lopdf::Dictionary) -> i64 {
-    let dp = dict.get(b"DecodeParms").or_else(|_| dict.get(b"DP"));
-    let d = match dp {
-        Ok(lopdf::Object::Dictionary(d)) => Some(d.clone()),
-        Ok(lopdf::Object::Array(a)) => a.iter().find_map(|x| x.as_dict().ok().cloned()),
-        Ok(lopdf::Object::Reference(id)) => None.or_else(|| {
-            let _ = id;
-            None
-        }),
+/// /DecodeParms 允许是字典、字典数组，也允许是**间接引用**。
+/// 旧实现遇到 Reference 直接返回 None，PNG predictor 因此整体失效。
+fn decode_parms(doc: &lopdf::Document, dict: &lopdf::Dictionary) -> Option<lopdf::Dictionary> {
+    let o = dict.get(b"DecodeParms").or_else(|_| dict.get(b"DP")).ok()?;
+    let o = resolve(doc, o);
+    let pick = |x: &lopdf::Object| match resolve(doc, x) {
+        lopdf::Object::Dictionary(d) => Some(d.clone()),
         _ => None,
     };
-    d.and_then(|d| d.get(b"Predictor").ok().and_then(obj_num))
+    match o {
+        lopdf::Object::Dictionary(d) => Some(d.clone()),
+        lopdf::Object::Array(a) => a.iter().find_map(pick),
+        _ => None,
+    }
+}
+
+fn predictor_of(doc: &lopdf::Document, dict: &lopdf::Dictionary) -> i64 {
+    decode_parms(doc, dict)
+        .and_then(|d| d.get(b"Predictor").ok().and_then(obj_num))
         .unwrap_or(1.0) as i64
 }
 
+/// LZW 的 EarlyChange（默认 1）：编码表长度达到 2^width - 1 时提前加宽码长
+fn early_change(doc: &lopdf::Document, dict: &lopdf::Dictionary) -> usize {
+    match decode_parms(doc, dict)
+        .and_then(|d| d.get(b"EarlyChange").ok().and_then(obj_num))
+    {
+        Some(v) if v <= 0.0 => 0,
+        _ => 1,
+    }
+}
+
+/// 恶意或畸形 PDF 的解压上限：不设上限时一个几十 KB 的流就能吃光内存，
+/// 而且 `catch_unwind` 拦不住 OOM abort。
+const MAX_DECODED_BYTES: u64 = 256 * 1024 * 1024;
+/// 单张图最多 5000 万像素（约 150MB RGB 缓冲）
+const MAX_IMAGE_PIXELS: u64 = 50_000_000;
+
 fn inflate(data: &[u8]) -> Option<Vec<u8>> {
-    // 先按 zlib 解（带 header），失败再按 raw deflate 试
+    // 先按 zlib 解（带 header），失败再按 raw deflate 试。
+    // take() 限制解压后的字节数，避免 zip bomb。
     for raw in [false, true] {
         let mut out = Vec::new();
         let r = if raw {
-            flate2::read::DeflateDecoder::new(data).read_to_end(&mut out)
+            flate2::read::DeflateDecoder::new(data)
+                .take(MAX_DECODED_BYTES)
+                .read_to_end(&mut out)
         } else {
-            flate2::read::ZlibDecoder::new(data).read_to_end(&mut out)
+            flate2::read::ZlibDecoder::new(data)
+                .take(MAX_DECODED_BYTES)
+                .read_to_end(&mut out)
         };
         if r.is_ok() || !out.is_empty() {
             if !out.is_empty() {
@@ -1024,6 +1083,152 @@ fn inflate(data: &[u8]) -> Option<Vec<u8>> {
         }
     }
     None
+}
+
+/// ASCII85Decode（Adobe 变体）：5 个可见字符 → 4 字节，`z` 是 4 个零，`~>` 结束
+fn ascii85_decode(data: &[u8]) -> Option<Vec<u8>> {
+    let mut out = Vec::new();
+    let mut group: Vec<u8> = Vec::with_capacity(5);
+    let mut ended = false;
+    for &b in data {
+        if ended {
+            break;
+        }
+        if b == b'~' {
+            ended = true;
+            continue;
+        }
+        if is_ws(b) {
+            continue;
+        }
+        if b == b'z' && group.is_empty() {
+            out.extend_from_slice(&[0, 0, 0, 0]);
+            continue;
+        }
+        if !(b'!'..=b'u').contains(&b) {
+            return None;
+        }
+        group.push(b - b'!');
+        if group.len() == 5 {
+            let mut v: u32 = 0;
+            for &d in &group {
+                v = v.wrapping_mul(85).wrapping_add(d as u32);
+            }
+            out.extend_from_slice(&v.to_be_bytes());
+            group.clear();
+        }
+    }
+    if !group.is_empty() {
+        let n = group.len();
+        while group.len() < 5 {
+            group.push(84); // 用 'u' 补齐
+        }
+        let mut v: u32 = 0;
+        for &d in &group {
+            v = v.wrapping_mul(85).wrapping_add(d as u32);
+        }
+        let bytes = v.to_be_bytes();
+        out.extend_from_slice(&bytes[..n - 1]);
+    }
+    Some(out)
+}
+
+/// LZWDecode（PDF 变体，MSB-first 变长码，ClearCode=256 / EOD=257）
+fn lzw_decode(data: &[u8], early: usize) -> Option<Vec<u8>> {
+    const CLEAR: u16 = 256;
+    const EOD: u16 = 257;
+    fn reset(table: &mut Vec<Vec<u8>>) {
+        table.clear();
+        for i in 0..256u16 {
+            table.push(vec![i as u8]);
+        }
+        table.push(Vec::new()); // CLEAR
+        table.push(Vec::new()); // EOD
+    }
+    let mut table: Vec<Vec<u8>> = Vec::new();
+    reset(&mut table);
+    let mut width = 9usize;
+    let mut bitbuf: u32 = 0;
+    let mut bits = 0usize;
+    let mut prev: Option<Vec<u8>> = None;
+    let mut out = Vec::new();
+    let mut pos = 0usize;
+    while pos < data.len() || bits >= width {
+        while bits < width && pos < data.len() {
+            bitbuf = (bitbuf << 8) | data[pos] as u32;
+            bits += 8;
+            pos += 1;
+        }
+        if bits < width {
+            break;
+        }
+        let code = ((bitbuf >> (bits - width)) & ((1u32 << width) - 1)) as u16;
+        bits -= width;
+        bitbuf = if bits == 0 { 0 } else { bitbuf & ((1u32 << bits) - 1) };
+        if code == CLEAR {
+            reset(&mut table);
+            width = 9;
+            prev = None;
+            continue;
+        }
+        if code == EOD {
+            break;
+        }
+        let entry: Vec<u8> = match table.get(code as usize) {
+            Some(e) if !e.is_empty() => e.clone(),
+            Some(_) => return None,
+            None => {
+                let p = prev.as_ref()?;
+                let mut e = p.clone();
+                e.push(p[0]);
+                e
+            }
+        };
+        out.extend_from_slice(&entry);
+        if let Some(p) = &prev {
+            let mut e = p.clone();
+            e.push(entry[0]);
+            table.push(e);
+        }
+        prev = Some(entry);
+        if table.len() + early >= (1usize << width) && width < 12 {
+            width += 1;
+        }
+        if out.len() as u64 > MAX_DECODED_BYTES {
+            return None;
+        }
+    }
+    Some(out)
+}
+
+/// RunLengthDecode：长度字节 <128 表示复制 n+1 个字面字节，>128 表示重复 257-n 次
+fn run_length_decode(data: &[u8]) -> Option<Vec<u8>> {
+    let mut out = Vec::new();
+    let mut i = 0usize;
+    while i < data.len() {
+        let n = data[i];
+        i += 1;
+        if n == 128 {
+            break;
+        }
+        if n < 128 {
+            let k = n as usize + 1;
+            if i + k > data.len() {
+                return None;
+            }
+            out.extend_from_slice(&data[i..i + k]);
+            i += k;
+        } else {
+            let k = 257 - n as usize;
+            let Some(&b) = data.get(i) else { return None };
+            i += 1;
+            out.extend(std::iter::repeat(b).take(k));
+        }
+        if out.len() as u64 > MAX_DECODED_BYTES {
+            return None;
+        }
+    }
+    Some(out)
 }
 
 /// 还原 PNG 预测器（Predictor >= 10）的行滤波。
@@ -1077,8 +1282,10 @@ fn undo_predictor(data: &[u8], row_bytes: usize, h: usize, colors: usize, bpc: u
     Some(out)
 }
 
-/// 把任意位深的采样值展开成每样本一字节
-fn expand_bits(raw: &[u8], count: usize, bpc: usize) -> Option<Vec<u8>> {
+/// 把任意位深的采样值展开成每样本一字节。
+/// `scale=false` 时保留 0..2^bpc-1 的**原始索引值**（Indexed 调色板必须用它查表），
+/// `scale=true` 时按最大亮度线性放大到 0..255（灰度/RGB 分量用）。
+fn expand_bits(raw: &[u8], count: usize, bpc: usize, scale: bool) -> Option<Vec<u8>> {
     match bpc {
         8 => {
             if raw.len() < count {
@@ -1100,11 +1307,15 @@ fn expand_bits(raw: &[u8], count: usize, bpc: usize) -> Option<Vec<u8>> {
                 for k in 0..per {
                     let shift = 8 - bpc * (k + 1);
                     let v = (b >> shift) & mask;
-                    out.push(match bpc {
-                        1 => if v == 1 { 255 } else { 0 },
-                        2 => v * 85,
-                        4 => v * 17,
-                        _ => v,
+                    out.push(if !scale {
+                        v
+                    } else {
+                        match bpc {
+                            1 => if v == 1 { 255 } else { 0 },
+                            2 => v * 85,
+                            4 => v * 17,
+                            _ => v,
+                        }
                     });
                     if out.len() == count {
                         return Some(out);
@@ -1203,19 +1414,44 @@ fn spec_to_rgb(spec: &Spec, raw: &[u8], count: usize, invert: bool) -> Option<(p
 }
 
 /// SMask（软蒙版）→ 每像素一字节的 alpha
+/// 按 /Filter 链解码图像流。返回 (数据, 是否为 JPEG 成品)。
+/// DCTDecode 之后的字节本身就是 JPEG，不能再喂给 PNG 编码器。
+fn decode_filters(
+    doc: &lopdf::Document,
+    dict: &lopdf::Dictionary,
+    payload: &[u8],
+) -> Option<(Vec<u8>, bool)> {
+    let mut data = payload.to_vec();
+    for f in filter_list(dict) {
+        match f.as_str() {
+            "FlateDecode" | "Fl" => data = inflate(&data)?,
+            "ASCII85Decode" | "A85" => data = ascii85_decode(&data)?,
+            "LZWDecode" | "LZW" => data = lzw_decode(&data, early_change(doc, dict))?,
+            "RunLengthDecode" | "RL" => data = run_length_decode(&data)?,
+            // JPX / CCITT 需要完整编解码器，暂不支持；明确返回 None 而不是继续用密文
+            "DCTDecode" | "DCT" => return Some((data, true)),
+            _ => return None,
+        }
+        if data.len() as u64 > MAX_DECODED_BYTES {
+            return None;
+        }
+    }
+    Some((data, false))
+}
+
 fn smask_alpha(doc: &lopdf::Document, dict: &lopdf::Dictionary) -> Option<Vec<u8>> {
     let id = dict.get(b"SMask").ok()?.as_reference().ok()?;
     let s = doc.get_object(id).ok()?.as_stream().ok()?;
     let w = s.dict.get(b"Width").ok().and_then(obj_num)? as usize;
     let h = s.dict.get(b"Height").ok().and_then(obj_num)? as usize;
-    let mut payload = s.content.clone();
-    for f in filter_list(&s.dict) {
-        match f.as_str() {
-            "FlateDecode" | "Fl" => payload = inflate(&payload)?,
-            _ => return None,
-        }
+    if (w as u64) * (h as u64) > MAX_IMAGE_PIXELS {
+        return None;
     }
-    let pred = predictor_of(&s.dict);
+    let (payload, jpeg) = decode_filters(doc, &s.dict, &s.content)?;
+    if jpeg {
+        return None;
+    }
+    let pred = predictor_of(doc, &s.dict);
     let raw = undo_predictor(&payload, w, h, 1, 8, pred)?;
     Some(raw)
 }
@@ -1241,32 +1477,30 @@ fn image_bytes(doc: &lopdf::Document, stream: &lopdf::Stream) -> Option<(String,
     let dict = &stream.dict;
     let w = dict.get(b"Width").ok().and_then(obj_num).unwrap_or(0.0).max(0.0) as u32;
     let h = dict.get(b"Height").ok().and_then(obj_num).unwrap_or(0.0).max(0.0) as u32;
-    if w < MIN_W || h < MIN_H {
+    // 尺寸下限过滤项目符号级小图标，上限防止畸形 PDF 用超大尺寸耗尽内存
+    if w < MIN_W || h < MIN_H || (w as u64) * (h as u64) > MAX_IMAGE_PIXELS {
         return None;
     }
     let bpc = dict.get(b"BitsPerComponent").ok().and_then(obj_num).unwrap_or(8.0).max(1.0) as usize;
 
-    let filters = filter_list(dict);
-    let mut payload: Vec<u8> = stream.content.clone();
-    for f in &filters {
-        match f.as_str() {
-            "FlateDecode" | "Fl" => payload = inflate(&payload)?,
-            "DCTDecode" | "DCT" => {
-                // JPEG 本体已是成品，直接落盘（不做色彩空间重编码）
-                return Some((".jpg".to_string(), payload));
-            }
-            // 其余滤镜（LZW / ASCII85 / RunLength / JPX）暂不支持
-            _ => return None,
-        }
+    let (payload, jpeg) = decode_filters(doc, dict, &stream.content)?;
+    if jpeg {
+        // JPEG 本体已是成品，直接落盘（不做色彩空间重编码）。
+        // 已知限制：CMYK 的 JPEG 若按 Adobe 反相约定编码，颜色会偏；
+        // 重新编码需要 JPEG 解码器，当前依赖里没有，保留原样优于丢弃图片。
+        return Some((".jpg".to_string(), payload));
     }
 
     let spec = color_spec(doc, dict)?;
     let colors = spec.components();
     let row_bytes = (w as usize * colors * bpc + 7) / 8;
-    let pred = predictor_of(dict);
+    let pred = predictor_of(doc, dict);
     let raw = undo_predictor(&payload, row_bytes, h as usize, colors, bpc, pred)?;
     let count = w as usize * h as usize * colors;
-    let samples = expand_bits(&raw, count, bpc)?;
+    // Indexed 色彩空间存的是调色板**索引**，低位深时不能放大成 0..255，
+    // 否则 1/2/4bit 的调色板图会整片错色。
+    let indexed = matches!(spec, Spec::Indexed { .. });
+    let samples = expand_bits(&raw, count, bpc, !indexed)?;
 
     // Indexed 的索引只有一个分量，展开后按调色板映射
     let invert = is_inverted(dict);
@@ -1276,6 +1510,16 @@ fn image_bytes(doc: &lopdf::Document, stream: &lopdf::Stream) -> Option<(String,
         None => (color, pixels),
     };
     Some((".png".to_string(), encode_png(w, h, color, &pixels)?))
+}
+
+/// 图片内容的短摘要（FNV-1a 低 32 位），用于给资源文件名去重
+fn short_hash(data: &[u8]) -> String {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for &b in data {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    format!("{:08x}", h & 0xffff_ffff)
 }
 
 fn extract_images(
@@ -1314,9 +1558,8 @@ fn extract_images(
     if all_ids.is_empty() {
         return out;
     }
-    if fs::create_dir_all(assets_dir).is_err() {
-        return out;
-    }
+    // 不要一上来就建 _assets：文档里没有可导出的图片（全是小图标 / 不支持的滤镜）时，
+    // 会留下一个空目录。等第一张图真正要落盘时再创建。
 
     // 统计每个图片对象出现在**多少页**。
     // 用来区分两种「重复」：
@@ -1341,6 +1584,7 @@ fn extract_images(
     // 每个对象只导出一次，多页复用时共享同一个相对路径
     let mut cache: HashMap<lopdf::ObjectId, String> = HashMap::new();
     let mut idx = 0usize;
+    let mut assets_ready = false;
 
     for (pno, pid) in pages.iter() {
         let draws = match meta.draws.get(pno) {
@@ -1389,7 +1633,15 @@ fn extract_images(
                 }
                 let Some((ext, bytes)) = image_bytes(doc, stream) else { continue };
                 idx += 1;
-                let base = format!("p{:03}_{}{}", pno, idx, ext);
+                // 文件名带内容摘要：两份不同的 PDF 输出到同一个 assets 目录时，
+                // 不会再因为都叫 p001_1.png 而互相覆盖
+                let base = format!("p{:03}_{}_{}{}", pno, idx, short_hash(&bytes), ext);
+                if !assets_ready {
+                    if fs::create_dir_all(assets_dir).is_err() {
+                        continue;
+                    }
+                    assets_ready = true;
+                }
                 if fs::write(assets_dir.join(&base), &bytes).is_err() {
                     continue;
                 }
@@ -1707,7 +1959,9 @@ fn bullet_prefix(t: &str) -> Option<String> {
     // （1）（一）/(1)/(a)
     if matches!(c, '（' | '(') {
         let inner: String = rest.chars().take_while(|x| *x != '）' && *x != ')').collect();
-        let after: String = rest.chars().skip(inner.len() + 1).collect();
+        // （一）等 CJK 编号占 3 字节，但 chars() 只算 1 个字符 —— 必须按字符数跳过，
+    // 否则 `（一）第一步` 会被吃掉两个字，输出成 `- 一步`。
+    let after: String = rest.chars().skip(inner.chars().count() + 1).collect();
         let looks_num = !inner.is_empty()
             && inner.chars().count() <= 4
             && inner
@@ -2504,6 +2758,9 @@ fn lines_to_md(
     let mut tables: HashMap<usize, (usize, String)> = HashMap::new();
     {
         let mut i = 0;
+        // 上一张表的结束位置。向上回扫表头/续行时不得越过它，
+        // 否则第二张表会把上一张表的尾部重新吞进来，出现重复行或整表被合并。
+        let mut last_table_end = 0usize;
         while i < all.len() {
             let Some(first) = table_cells(&all[i]) else {
                 i += 1;
@@ -2594,7 +2851,7 @@ fn lines_to_md(
             if header.is_none() {
                 let mut pend: Vec<(usize, String)> = Vec::new();
                 let mut back: Vec<Vec<String>> = Vec::new();
-                while begin > 0 {
+                while begin > last_table_end {
                     let l = &all[begin - 1];
                     if l.page != all[i].page || (l.size - all[i].size).abs() > 0.8 {
                         break;
@@ -2694,6 +2951,7 @@ fn lines_to_md(
                 continue;
             }
             tables.insert(begin, (end - 1, render_table(&out_rows)));
+            last_table_end = end;
             i = end;
         }
     }

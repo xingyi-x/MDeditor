@@ -2,6 +2,10 @@
 'use strict';
 window.MD = window.MD || {};
 
+// paged.js 关闭自动执行，改为手动触发。必须在动态加载 paged.polyfill 之前设置。
+// 原来写在 index.html 的内联 <script> 里，为了启用严格 CSP 移到了这里。
+window.PagedConfig = { auto: false };
+
 MD.util = {
   $(sel, root) { return (root || document).querySelector(sel); },
   $$(sel, root) { return Array.from((root || document).querySelectorAll(sel)); },

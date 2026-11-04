@@ -28,6 +28,11 @@ pub fn is_supported(ext: &str) -> bool {
     SUPPORTED_EXTS.contains(&ext)
 }
 
+/// 是否为「原样透传」的输入：.md / .markdown 不整理内容、不额外加 front matter
+pub fn is_passthrough_ext(ext: &str) -> bool {
+    matches!(ext, "md" | "markdown")
+}
+
 pub fn ext_of(p: &Path) -> String {
     p.extension()
         .map(|s| s.to_string_lossy().to_lowercase())
@@ -158,20 +163,11 @@ pub fn xml_attr(e: &quick_xml::events::BytesStart, key: &str) -> Option<String> 
 
 /* ────────── 文本收尾整理 ────────── */
 
-/// 统一整理 Markdown：压缩空行、规范标题/列表/表格空行、去掉行尾空白
+/// 统一整理 Markdown：压缩空行、规范标题/列表/表格空行、去掉行尾空白。
+/// 代码块（``` 或 ~~~ 围栏，含缩进、长度 ≥3）内部及围栏行本身原样输出，不做任何整理。
 pub fn tidy(md: &str) -> String {
     let src = md.replace("\r\n", "\n").replace('\r', "\n");
-    let mut lines: Vec<String> = src.split('\n').map(|l| l.to_string()).collect();
-
-    // 去掉行尾空白（保留用于软换行的两个空格）
-    for l in lines.iter_mut() {
-        let trimmed = l.trim_end();
-        if l.len() - trimmed.len() == 2 && !trimmed.is_empty() {
-            *l = format!("{}  ", trimmed);
-        } else {
-            *l = trimmed.to_string();
-        }
-    }
+    let lines: Vec<String> = src.split('\n').map(|l| l.to_string()).collect();
 
     fn is_list_line(s: &str) -> bool {
         let t = s.trim_start();
@@ -185,19 +181,17 @@ pub fn tidy(md: &str) -> String {
     fn is_block_start(s: &str) -> bool {
         let t = s.trim_start();
         t.starts_with('#')
-            || t.starts_with("|")
+            || t.starts_with('|')
             || t.starts_with("```")
+            || t.starts_with("~~~")
             || t.starts_with("---")
             || t.starts_with("***")
             || t.starts_with("> ")
             || t == ">"
             || t.starts_with("![")
     }
-    /// 前后两行属于同一个块（表格 / 列表 / 引用 / 代码块）→ 中间不加空行
-    fn same_block(a: &str, b: &str, in_fence: bool) -> bool {
-        if in_fence {
-            return true;
-        }
+    /// 前后两行属于同一个块（表格 / 列表 / 引用）→ 中间不加空行
+    fn same_block(a: &str, b: &str) -> bool {
         let (x, y) = (a.trim_start(), b.trim_start());
         if x.starts_with('|') && y.starts_with('|') {
             return true;
@@ -211,10 +205,65 @@ pub fn tidy(md: &str) -> String {
         }
         false
     }
+    /// 识别围栏行：允许缩进、``` 或 ~~~、长度 ≥3；返回 (字符, 长度, 是否纯围栏行)
+    fn fence_marker(s: &str) -> Option<(u8, usize, bool)> {
+        let t = s.trim_start();
+        let b = t.as_bytes();
+        let ch = *b.first()?;
+        if ch != b'`' && ch != b'~' {
+            return None;
+        }
+        let mut n = 0;
+        while n < b.len() && b[n] == ch {
+            n += 1;
+        }
+        if n < 3 {
+            return None;
+        }
+        let pure = t[n..].chars().all(|c| c.is_whitespace());
+        Some((ch, n, pure))
+    }
 
     let mut out: Vec<String> = Vec::with_capacity(lines.len());
-    let mut in_fence = false;
-    for line in lines.into_iter() {
+    let mut fence: Option<(u8, usize)> = None; // 当前围栏的（字符, 长度）
+    for line in lines {
+        // 围栏行 / 围栏内部：原样输出，不做任何整理
+        if let Some((ch, n, pure)) = fence_marker(&line) {
+            match fence {
+                None => {
+                    // 进入围栏：前面补一个空行（不改围栏行本身），随后原样输出
+                    if out.last().map(|l| !l.trim().is_empty()).unwrap_or(false) {
+                        out.push(String::new());
+                    }
+                    fence = Some((ch, n));
+                    out.push(line);
+                    continue;
+                }
+                Some((fch, flen)) => {
+                    // 关闭围栏需同字符、长度 ≥ 起始、且该行为纯围栏行
+                    if ch == fch && n >= flen && pure {
+                        fence = None;
+                    }
+                    out.push(line);
+                    continue;
+                }
+            }
+        }
+        if fence.is_some() {
+            out.push(line);
+            continue;
+        }
+
+        // 以下整理仅作用于普通文本行
+        let mut line = line;
+        {
+            let trimmed = line.trim_end();
+            if line.len() - trimmed.len() == 2 && !trimmed.is_empty() {
+                line = format!("{}  ", trimmed);
+            } else {
+                line = trimmed.to_string();
+            }
+        }
         // 折叠多余空行
         if line.trim().is_empty() {
             if out.last().map(|l| l.trim().is_empty()).unwrap_or(true) {
@@ -243,12 +292,9 @@ pub fn tidy(md: &str) -> String {
         if is_block_start(&line)
             && !prev.is_empty()
             && out.last().map(|l| !l.trim().is_empty()).unwrap_or(false)
-            && !same_block(&prev, &line, in_fence)
+            && !same_block(&prev, &line)
         {
             out.push(String::new());
-        }
-        if line.trim_start().starts_with("```") {
-            in_fence = !in_fence;
         }
         out.push(line);
     }
@@ -261,52 +307,88 @@ pub fn tidy(md: &str) -> String {
     s
 }
 
-/// 转义表格单元格
+/// 转义表格单元格（先 trim 再替换，避免末尾换行留下多余 <br>）
 pub fn cell_text(s: &str) -> String {
-    s.replace('|', "\\|").replace('\n', "<br>").trim().to_string()
+    let t = s.trim();
+    t.replace('|', "\\|").replace('\n', "<br>")
 }
 
 /* ────────── .doc（旧版二进制）→ 用 Word/WPS COM 转 docx ────────── */
 
 pub fn doc_to_docx(src: &Path, dst: &Path) -> Result<(), String> {
-    let ps = format!(
-        "$ErrorActionPreference='Stop'\n\
-         $src = '{}'\n\
-         $dst = '{}'\n\
-         $app = $null\n\
-         foreach ($prog in @('Word.Application','KWPS.Application','WPS.Application')) {{\n\
-         \x20 try {{ $app = New-Object -ComObject $prog; break }} catch {{ }}\n\
-         }}\n\
-         if (-not $app) {{ exit 3 }}\n\
-         $app.Visible = $false\n\
-         $app.DisplayAlerts = 0\n\
-         $doc = $app.Documents.Open($src, $false, $true)\n\
-         $doc.SaveAs([ref]$dst, [ref]16)\n\
-         $doc.Close([ref]0)\n\
-         $app.Quit()\n\
-         exit 0\n",
-        src.to_string_lossy().replace('\'', "''"),
-        dst.to_string_lossy().replace('\'', "''"),
-    );
+    // 脚本里完全不拼接路径：src/dst 通过环境变量传入。
+    // 这样既避免 PowerShell 单引号把 Unicode 智能引号（‘ ’ ‚ ‛）也当引号导致注入，
+    // 也避免中文路径拼进脚本后被 PowerShell 5.1 按 GBK 解码而乱码。
+    let ps = r#"$ErrorActionPreference='Stop'
+$src = $env:MDEDITOR_SRC
+$dst = $env:MDEDITOR_DST
+$app = $null
+$doc = $null
+$code = 1
+try {
+    foreach ($prog in @('Word.Application','KWPS.Application','WPS.Application')) {
+        try { $app = New-Object -ComObject $prog; break } catch { }
+    }
+    if (-not $app) {
+        $code = 3
+    } else {
+        $app.Visible = $false
+        $app.DisplayAlerts = 0
+        $doc = $app.Documents.Open($src, $false, $true)
+        $doc.SaveAs([ref]$dst, [ref]16)
+        $code = 0
+    }
+} catch {
+    try { [Console]::Error.WriteLine($_.Exception.Message) } catch { }
+    $code = 1
+} finally {
+    if ($doc) { try { $doc.Close([ref]0) } catch { } }
+    if ($app) { try { $app.Quit() } catch { } }
+}
+exit $code
+"#;
+    // PowerShell 5.1 的 -File 对无 BOM 脚本按系统 ANSI(GBK) 解码；加 UTF-8 BOM 保证按 UTF-8 读取
+    let mut content = Vec::with_capacity(ps.len() + 3);
+    content.extend_from_slice(&[0xEF, 0xBB, 0xBF]);
+    content.extend_from_slice(ps.as_bytes());
     let script = std::env::temp_dir().join(format!("mdeditor_doc2docx_{}.ps1", now_id()));
-    fs::write(&script, ps).map_err(|e| format!("无法写临时脚本：{}", e))?;
+    fs::write(&script, &content).map_err(|e| format!("无法写临时脚本：{}", e))?;
 
-    let status = std::process::Command::new("powershell")
+    let script_path = script.to_string_lossy().into_owned();
+    let output = std::process::Command::new("powershell")
         .args([
             "-NoProfile",
             "-ExecutionPolicy",
             "Bypass",
             "-File",
-            &script.to_string_lossy(),
+            script_path.as_str(),
         ])
+        .env("MDEDITOR_SRC", src.as_os_str())
+        .env("MDEDITOR_DST", dst.as_os_str())
         .creation_flags_no_window()
-        .status();
+        .output();
     let _ = fs::remove_file(&script);
 
-    match status {
-        Ok(st) if st.success() && dst.exists() => Ok(()),
-        Ok(_) => Err("无法转换 .doc（旧版二进制格式）：本机未安装 Word/WPS，请用 Word 另存为 .docx 后重试".into()),
+    match output {
         Err(e) => Err(format!("调用 PowerShell 失败：{}", e)),
+        Ok(o) => {
+            let code = o.status.code();
+            if o.status.success() && dst.exists() {
+                Ok(())
+            } else if code == Some(3) {
+                // COM 创建失败 = 本机未安装 Word/WPS
+                Err("无法转换 .doc：本机未安装 Word/WPS（COM 组件不可用），请用 Word 另存为 .docx 后重试".into())
+            } else {
+                // 脚本有 stderr / 非零退出 = 转换过程失败，不能笼统归为「未安装」
+                let detail = String::from_utf8_lossy(&o.stderr);
+                let detail = detail.trim();
+                if detail.is_empty() {
+                    Err(format!("无法转换 .doc：Word/WPS 转换失败（退出码 {:?}）", code))
+                } else {
+                    Err(format!("无法转换 .doc：Word/WPS 转换失败（退出码 {:?}）：{}", code, detail))
+                }
+            }
+        }
     }
 }
 
@@ -344,6 +426,10 @@ fn now_id() -> String {
 
 /// 把文件转换为 Markdown 字符串（不写盘；图片会写到 out_md 旁边的 _assets 目录）
 pub fn convert_bytes(ext: &str, data: &[u8], out_md: &Path, opts: &Options) -> Result<String, String> {
+    // .md / .markdown 原样透传：保留行尾空格（Markdown 硬换行）与所有换行，不经过 tidy
+    if is_passthrough_ext(ext) {
+        return Ok(plain::passthrough(data));
+    }
     let md = match ext {
         "docx" => {
             let mut ctx = Ctx::new(out_md, opts);
@@ -359,7 +445,6 @@ pub fn convert_bytes(ext: &str, data: &[u8], out_md: &Path, opts: &Options) -> R
         "rtf" => rtf::convert(data)?,
         "txt" | "text" | "log" => plain::text(data),
         "csv" | "tsv" => plain::delimited(data, ext == "tsv"),
-        "md" | "markdown" => plain::text(data),
         other => return Err(format!("不支持的文件类型：.{}", other)),
     };
     Ok(tidy(&md))
@@ -399,7 +484,8 @@ pub fn convert_and_write(
         return Err(format!("目标已存在：{}（加 --force 覆盖）", out_md.display()));
     }
     let mut md = convert_file_to_string(input, out_md, opts)?;
-    if opts.front_matter {
+    // front matter 只对「转换出来」的格式有意义；.md / .markdown 原样透传，不改变原文
+    if opts.front_matter && !is_passthrough_ext(&ext_of(input)) {
         md = front_matter_of(input, &md);
     }
     if let Some(parent) = out_md.parent() {
@@ -431,22 +517,24 @@ pub fn front_matter_of(input: &Path, md: &str) -> String {
 }
 
 fn chrono_like_now() -> String {
-    // 不引入 chrono：UTC+8 本地时间的简易计算
+    // 取自本机时间（东八区 UTC+08:00）：不引入 chrono，按固定 +8 偏移换算后写成带时区偏移的 ISO 8601。
+    // 说明：标准库无法自动探测本机时区，偏移固定为 +08:00，并以 +08:00 明确标注，不再是「无时区的本地时间」。
     let secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
+        .map(|d| d.as_secs() as i64)
         .unwrap_or(0)
         + 8 * 3600;
-    let days = (secs / 86400) as i64;
-    let rem = secs % 86400;
+    let days = secs.div_euclid(86400);
+    let rem = secs.rem_euclid(86400);
     let (y, m, d) = civil_from_days(days);
     format!(
-        "{:04}-{:02}-{:02} {:02}:{:02}",
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}+08:00",
         y,
         m,
         d,
         rem / 3600,
-        (rem / 60) % 60
+        (rem / 60) % 60,
+        rem % 60
     )
 }
 

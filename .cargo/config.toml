@@ -1,9 +1,12 @@
-# Rust / Cargo 构建配置：使用国内镜像加速 crates 下载
-[source.crates-io]
-replace-with = "rsproxy-sparse"
-
-[source.rsproxy-sparse]
-registry = "sparse+https://rsproxy.cn/index/"
+# Cargo build settings shared by this repo.
+# Do NOT force a crates.io mirror here: overseas users and CI may be slowed down
+# or fail entirely. If you need a domestic mirror, add it locally (see README):
+#
+# [source.crates-io]
+# replace-with = "rsproxy-sparse"
+#
+# [source.rsproxy-sparse]
+# registry = "sparse+https://rsproxy.cn/index/"
 
 [net]
 retry = 3

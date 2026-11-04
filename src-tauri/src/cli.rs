@@ -4,6 +4,7 @@
  *
  * 因为是 GUI 子系统的 exe（双击不弹黑框），命令行模式下需要主动附加到父控制台输出。
  */
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use crate::convert;
@@ -32,7 +33,7 @@ MDeditor — 文档转 Markdown（本地离线，为 AI 阅读优化）
 
 示例:
   mdeditor.exe --to-md 报告.pdf
-  mdeditor.exe --to-md D:\\docs --r --d D:\\docs\\md
+  mdeditor.exe --to-md D:\\docs -r -d D:\\docs\\md
   mdeditor.exe --to-md 论文.docx --stdout > 论文.md
   mdeditor.exe --to-md 手册.pdf --no-images --front-matter
 ";
@@ -65,7 +66,21 @@ pub fn maybe_run_cli() -> Option<i32> {
     Some(code)
 }
 
+/// 错误 / 进度 / 提示一律写 stderr，避免混进 --stdout 重定向的输出文件
 fn emit(s: &str) {
+    #[cfg(windows)]
+    {
+        con::write_err(s);
+        con::write_err("\n");
+    }
+    #[cfg(not(windows))]
+    {
+        eprintln!("{}", s);
+    }
+}
+
+/// 正常数据输出写 stdout：仅 --stdout 的转换结果、帮助/版本、--quiet 的路径
+fn emit_out(s: &str) {
     #[cfg(windows)]
     {
         con::write(s);
@@ -137,11 +152,11 @@ fn parse_args(args: Vec<String>) -> Opts {
             "--front-matter" => o.front_matter = true,
             "--quiet" | "-q" => o.quiet = true,
             "-h" | "--help" => {
-                emit(USAGE);
+                emit_out(USAGE);
                 std::process::exit(0);
             }
             "--version" => {
-                emit(&format!("MDeditor {}", env!("CARGO_PKG_VERSION")));
+                emit_out(&format!("MDeditor {}", env!("CARGO_PKG_VERSION")));
                 std::process::exit(0);
             }
             other => {
@@ -192,19 +207,22 @@ fn run(args: Vec<String>) -> i32 {
 
     let mut ok = 0usize;
     let mut failed = 0usize;
+    // 本次运行已分配的输出路径：避免 -d 拍平目录时同名文件互相静默覆盖
+    let mut used: HashSet<PathBuf> = HashSet::new();
     for f in &files {
-        let out_path = target_path(f, &o, files.len() == 1);
+        let out_path = target_path(f, &o, files.len() == 1, &mut used);
         match convert::convert_file_to_string(f, &out_path, &opts) {
             Err(e) => {
                 failed += 1;
                 emit(&format!("[失败] {} — {}", f.display(), e));
             }
             Ok(mut md) => {
-                if opts.front_matter {
+                // front matter 只对转换出来的格式有意义；原样透传的 md/markdown 不加
+                if opts.front_matter && !convert::is_passthrough_ext(&convert::ext_of(f)) {
                     md = convert::front_matter_of(f, &md);
                 }
                 if o.stdout {
-                    emit(&md);
+                    emit_out(&md);
                     ok += 1;
                     continue;
                 }
@@ -217,7 +235,7 @@ fn run(args: Vec<String>) -> i32 {
                     Ok(_) => {
                         ok += 1;
                         if o.quiet {
-                            emit(&out_path.to_string_lossy());
+                            emit_out(&out_path.to_string_lossy());
                         } else {
                             emit(&format!(
                                 "[完成] {} → {}（{} 字符）",
@@ -246,11 +264,13 @@ fn run(args: Vec<String>) -> i32 {
     }
 }
 
-fn target_path(f: &Path, o: &Opts, single: bool) -> PathBuf {
+fn target_path(f: &Path, o: &Opts, single: bool, used: &mut HashSet<PathBuf>) -> PathBuf {
     // -o 只对单文件模式有意义：批量时若每个文件都往同一个路径写，会互相覆盖
     if single {
         if let Some(out) = &o.out {
-            return PathBuf::from(out);
+            let p = PathBuf::from(out);
+            used.insert(p.clone());
+            return p;
         }
     }
     let name = format!(
@@ -261,20 +281,23 @@ fn target_path(f: &Path, o: &Opts, single: bool) -> PathBuf {
         Some(d) => PathBuf::from(d).join(name),
         None => f.with_extension("md"),
     };
-    if base.exists() && !o.force {
-        // 避免覆盖：自动改名
+    let mut chosen = base.clone();
+    // 目标已存在或本次已分配过（拍平目录同名）：自动改名，后缀统一为 -1/-2…
+    if (chosen.exists() || used.contains(&chosen)) && !o.force {
         let stem = base
             .file_stem()
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_default();
         for i in 1..999 {
-            let cand = base.with_file_name(format!("{}_{}.md", stem, i));
-            if !cand.exists() {
-                return cand;
+            let cand = base.with_file_name(format!("{}-{}.md", stem, i));
+            if !cand.exists() && !used.contains(&cand) {
+                chosen = cand;
+                break;
             }
         }
     }
-    base
+    used.insert(chosen.clone());
+    chosen
 }
 
 fn collect_files(dir: &Path, recursive: bool, out: &mut Vec<PathBuf>) {
@@ -387,9 +410,8 @@ mod con {
         }
     }
 
-    pub fn write(s: &str) {
+    fn write_handle(h: *mut c_void, s: &str) {
         unsafe {
-            let h = get(STD_OUTPUT_HANDLE);
             if h.is_null() {
                 return;
             }
@@ -400,6 +422,14 @@ mod con {
             let mut written: u32 = 0;
             WriteFile(h, b.as_ptr(), b.len() as u32, &mut written, std::ptr::null_mut());
         }
+    }
+
+    pub fn write(s: &str) {
+        write_handle(get(STD_OUTPUT_HANDLE), s);
+    }
+
+    pub fn write_err(s: &str) {
+        write_handle(get(STD_ERROR_HANDLE), s);
     }
 
     pub fn flush() {
