@@ -1,6 +1,6 @@
 [package]
 name = "mdeditor"
-version = "1.3.0"
+version = "1.4.0"
 description = "本地 Markdown 阅读与排版编辑器"
 authors = ["local"]
 edition = "2021"
@@ -18,6 +18,8 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 encoding_rs = "0.8"
 base64 = "0.22"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+trash = "5"
 
 # ── 文档转换（PDF / Word / Excel / PPT / HTML → Markdown） ──
 zip = { version = "2", default-features = false, features = ["deflate"] }
@@ -27,13 +29,22 @@ lopdf = "0.34"
 png = "0.17"
 flate2 = "1"
 regex = "1"
+# CMYK / YCCK JPEG 需要真正解码后重编码成 PNG，否则预览颜色反相
+jpeg-decoder = "0.3"
 
 # ── PDF 导出：直接调 WebView2 的 PrintToPdf（关掉页眉页脚） ──
 # 版本必须与 tauri/wry 传递依赖一致，否则 ICoreWebView2* 之类的
 # COM 接口类型不互通（cast 会编译失败）
 [target.'cfg(windows)'.dependencies]
 webview2-com = "0.39"
-windows = "0.62"
+# 显式声明用到的 feature：CreateMutexW 被 Win32_Security 门控，
+# 只靠 tauri 的传递 feature 聚合会在不同依赖版本下失效
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_Threading",
+    "Win32_UI_WindowsAndMessaging",
+] }
 
 [profile.release]
 # 不能开 panic = "abort"：pdf-extract 对畸形 PDF 会 panic，

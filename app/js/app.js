@@ -49,6 +49,19 @@
     U.$('#st-reading').textContent = `约 ${min} 分钟`;
   }
 
+  // doc:changed 每次按键都会同步跑一次全文字数统计，且与防抖后 renderNow 里那次
+  // updateCounts 重复。用 rAF 把同一帧内的多次统计合并成一次，降低高频计算开销；
+  // 渲染主链 renderNow 本身已是 U.debounce(220ms)，不重复叠加节流，
+  // render:done 的触发语义与时机保持不变。
+  let _countsRaf = 0;
+  function scheduleUpdateCounts() {
+    if (_countsRaf) return;
+    _countsRaf = requestAnimationFrame(() => {
+      _countsRaf = 0;
+      updateCounts(MD.editor.value);
+    });
+  }
+
   function updateStatusBar() {
     const p = state.currentFile;
     const el = U.$('#st-path');
@@ -206,6 +219,7 @@
     exportWord: () => MD.actions.exportWord(),
     exportTXT: () => MD.actions.exportTXT(),
     exportTheme: () => MD.actions.exportTheme(),
+    importTheme: () => MD.theme.importTheme(),
     viewSource: () => setView('source'),
     viewSplit: () => setView('split'),
     viewPreview: () => setView('preview'),
@@ -568,6 +582,79 @@
     }
   }, 1500);
 
+  /* ══════════ 外部修改检测（低频轮询，仅桌面版真实文件） ══════════
+     维护「基准 mtime」：打开 / 另存为 / 保存（含自动保存）成功后重新取样，
+     否则下一次轮询会把「自己刚写的盘」误判成外部修改。 */
+  const EXTERNAL_POLL_MS = 2000;
+  let watchBasePath = null;       // 基准对应的文件路径
+  let watchBaseMtime = null;      // 基准 mtime（Unix 毫秒）；null = 暂不可轮询
+  let watchNeedsBaseline = true;  // 打开/保存后先置 true，基准重建完成前轮询不判定
+  let watchSeq = 0;               // 代次：丢弃过期的异步 mtime 结果
+  let watchBusy = false;          // 避免一次检查未完成时重叠
+
+  function refreshWatchBaseline() {
+    watchNeedsBaseline = true;
+    const seq = ++watchSeq;
+    const path = state.currentFile;
+    if (!path || !MD.fsx.isApp) {
+      watchBasePath = path || null;
+      watchBaseMtime = null;
+      return;
+    }
+    MD.fsx.fileMtime(path).then((m) => {
+      if (seq !== watchSeq) return;   // 期间又打开/保存过，丢弃旧结果
+      watchBasePath = path;
+      watchBaseMtime = (m == null) ? null : m;
+      watchNeedsBaseline = false;
+    }).catch(() => { /* fileMtime 已吞异常，这里仅兜底 */ });
+  }
+
+  /** 用磁盘内容替换编辑器。MD.editor.value 的 setter 已 clearHistory + markClean
+      并抑制 doc:changed；再借 doc:saved（现有事件）把 dirty 置 false 并重建基准。 */
+  async function reloadFromDisk(path) {
+    try {
+      const text = await MD.fsx.readFile(path);
+      MD.editor.value = text;
+      MD.bus.emit('doc:saved');
+      MD.app.renderPreview();
+      MD.toast('文件已在外部更新，已重新加载');
+    } catch (e) {
+      MD.toast('重新加载失败：' + (e && e.message ? e.message : e));
+    }
+  }
+
+  async function checkExternalChange() {
+    if (document.hidden || watchBusy) return;
+    const path = state.currentFile;
+    if (!path || !MD.fsx.isApp) return;
+    // 基准重建中、或刚切换文档基准还没跟上：跳过，不做「变化」判定
+    if (watchNeedsBaseline || watchBaseMtime == null || path !== watchBasePath) return;
+    watchBusy = true;
+    try {
+      const m = await MD.fsx.fileMtime(path);
+      if (m == null || m === watchBaseMtime) return;
+      // 先把基准对齐到本次观测值：无论重载成功 / 用户取消 / 读取失败，
+      // 都不会对同一次外部修改反复弹窗或反复重载
+      watchBaseMtime = m;
+      if (state.dirty && !confirm('文件已在外部被修改，是否放弃本地未保存修改并重新加载？')) {
+        return;                       // 取消：保留本地未保存修改，基准已更新
+      }
+      await reloadFromDisk(path);
+    } finally {
+      watchBusy = false;
+    }
+  }
+
+  /** 单一递归 setTimeout 链：全程只启动一次，切换文档不会叠加旧计时器 */
+  function startExternalWatch() {
+    const tick = async () => {
+      try { await checkExternalChange(); }
+      catch (e) { console.warn('外部修改检测异常', e); }  // 别让轮询把异常抛到全局
+      setTimeout(tick, EXTERNAL_POLL_MS);
+    };
+    setTimeout(tick, EXTERNAL_POLL_MS);
+  }
+
   /* ══════════ 启动 ══════════ */
   async function boot() {
     MD.loadSettings();
@@ -599,24 +686,25 @@
     // 状态联动
     MD.bus.on('doc:changed', () => {
       renderNow();
-      updateCounts(MD.editor.value);
+      scheduleUpdateCounts();
       updateStatusBar();
       autoSave();
     });
     MD.bus.on('cursor:moved', (pos) => {
       U.$('#st-cursor').textContent = `行 ${pos.line + 1}，列 ${pos.ch + 1}`;
     });
-    MD.bus.on('doc:opened', () => { updateStatusBar(); updateWindowTitle(); });
-    MD.bus.on('doc:saved', () => updateWindowTitle());
+    MD.bus.on('doc:opened', () => { updateStatusBar(); updateWindowTitle(); refreshWatchBaseline(); });
+    MD.bus.on('doc:saved', () => { updateWindowTitle(); refreshWatchBaseline(); });
     // 文件树里删掉当前正在编辑的文件：必须清空当前文件引用，
     // 否则 1.5 秒后的自动保存会把已删除的文件又写回磁盘（"文件复活"）。
     MD.bus.on('doc:close-request', () => { MD.actions.closeDocForce(); });
-    MD.bus.on('doc:renamed', () => { updateStatusBar(); updateWindowTitle(); });
+    MD.bus.on('doc:renamed', () => { updateStatusBar(); updateWindowTitle(); refreshWatchBaseline(); });
     MD.bus.on('theme:applied', () => {
       U.$('#st-theme').textContent = (MD.theme.getTheme(MD.settings.docTheme).name || '主题');
     });
     MD.bus.on('render:needed', renderNow);
     MD.bus.emit('theme:applied');
+    startExternalWatch();
 
     // 关闭拦截：WebView2 里 beforeunload 不可靠，优先用 Tauri 的 onCloseRequested。
     // 若运行时拿不到该 API，只能退回 beforeunload，此时 Rust 侧需拦截 CloseRequested 才能兜住。

@@ -6,6 +6,7 @@
 pub mod docx;
 pub mod html;
 pub mod pdf;
+mod pdf_image;
 pub mod plain;
 pub mod pptx;
 pub mod rtf;
@@ -517,37 +518,7 @@ pub fn front_matter_of(input: &Path, md: &str) -> String {
 }
 
 fn chrono_like_now() -> String {
-    // 取自本机时间（东八区 UTC+08:00）：不引入 chrono，按固定 +8 偏移换算后写成带时区偏移的 ISO 8601。
-    // 说明：标准库无法自动探测本机时区，偏移固定为 +08:00，并以 +08:00 明确标注，不再是「无时区的本地时间」。
-    let secs = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
-        + 8 * 3600;
-    let days = secs.div_euclid(86400);
-    let rem = secs.rem_euclid(86400);
-    let (y, m, d) = civil_from_days(days);
-    format!(
-        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}+08:00",
-        y,
-        m,
-        d,
-        rem / 3600,
-        (rem / 60) % 60,
-        rem % 60
-    )
-}
-
-/// 天数 → 年月日（Howard Hinnant 算法）
-fn civil_from_days(z: i64) -> (i64, u32, u32) {
-    let z = z + 719468;
-    let era = if z >= 0 { z } else { z - 146096 } / 146097;
-    let doe = (z - era * 146097) as i64;
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
-    let y = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
-    (if m <= 2 { y + 1 } else { y }, m, d)
+    // 用 chrono 读取本机时区，输出带真实 UTC 偏移的 ISO 8601。
+    // 旧实现把偏移写死成 +08:00，跨时区使用或夏令时切换时会给出错误时间。
+    chrono::Local::now().format("%Y-%m-%dT%H:%M:%S%:z").to_string()
 }

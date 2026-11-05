@@ -63,6 +63,17 @@
       return i ? { name: i.name, path: i.path, isDir: i.is_dir, ext: i.ext, size: i.size, mtimeMs: i.modified_ms } : null;
     },
     async exists(p) { return invoke('path_exists', { path: p }); },
+    /** 文件最后修改时间（Unix 毫秒）。Rust 命令约定：Ok(Some(u64)) → 数字、
+     *  Ok(None) → null（文件不存在）、Err(String) → 抛错。这里统一吞掉异常返回 null，
+     *  避免低频轮询把错误抛到全局。 */
+    async fileMtime(p) {
+      try {
+        const v = await invoke('file_mtime', { path: p });
+        return (typeof v === 'number' && Number.isFinite(v)) ? v : null;
+      } catch (e) {
+        return null;
+      }
+    },
     async mkdir(p) { await invoke('create_dir', { path: p }); },
     async remove(p) { await invoke('remove_path', { path: p }); },
     async rename(from, to) { await invoke('rename_path', { from, to }); },
@@ -229,6 +240,13 @@
       } catch (e) { return null; }
     },
     async exists(p) { return (await this.stat(p)) != null; },
+    /** 浏览器模式没有 file_mtime 命令，退回到 File System Access 的 lastModified（毫秒） */
+    async fileMtime(p) {
+      try {
+        const st = await this.stat(p);
+        return st && typeof st.mtimeMs === 'number' ? st.mtimeMs : null;
+      } catch (e) { return null; }
+    },
     async mkdir(p) { await resolveDirForWrite(p + '/x'); },
     async remove(p) {
       const parts = normParts(p);

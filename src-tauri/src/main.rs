@@ -348,6 +348,23 @@ fn path_exists(path: String) -> Result<bool, String> {
     Ok(Path::new(&path).exists())
 }
 
+/// 外部修改检测用：返回文件最后修改时间（Unix 毫秒）；文件不存在返回 Ok(None)。
+#[tauri::command]
+async fn file_mtime(path: String) -> Result<Option<u64>, String> {
+    on_worker(move || {
+        match fs::metadata(&path) {
+            Ok(m) => Ok(m
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_millis() as u64)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e.to_string()),
+        }
+    })
+    .await
+}
+
 #[tauri::command]
 fn create_dir(path: String) -> Result<(), String> {
     fs::create_dir_all(&path).map_err(to_string_err)
@@ -357,11 +374,12 @@ fn create_dir(path: String) -> Result<(), String> {
 fn remove_path(path: String) -> Result<(), String> {
     guarded_write_path(&path, false)?;
     let p = Path::new(&path);
-    if p.is_dir() {
-        fs::remove_dir_all(p).map_err(to_string_err)
-    } else {
-        fs::remove_file(p).map_err(to_string_err)
+    if !p.exists() {
+        return Err(format!("路径不存在：{}", path));
     }
+    // 送进系统回收站而不是永久删除。失败时明确报错，绝不回退成 fs::remove_*，
+    // 否则用户会在「以为可还原」的前提下被永久删除。
+    trash::delete(p).map_err(|e| format!("移入回收站失败（文件未被删除）：{}", e))
 }
 
 #[tauri::command]
@@ -962,6 +980,48 @@ fn open_default_apps_settings() -> Result<(), String> {
     }
 }
 
+/// 单实例：Windows 命名互斥体。句柄随进程一直持有，第二个实例拿到
+/// ERROR_ALREADY_EXISTS 后提示用户并直接退出，避免两个窗口同时写同一文档。
+/// CLI 转换在 main() 开头就已经 exit，不受影响；--pdf-out 自动化导出显式跳过。
+#[cfg(windows)]
+fn acquire_single_instance() -> bool {
+    use windows::core::PCWSTR;
+    use windows::Win32::Foundation::{GetLastError, ERROR_ALREADY_EXISTS};
+    use windows::Win32::System::Threading::CreateMutexW;
+    use windows::Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_ICONINFORMATION, MB_OK};
+
+    let name: Vec<u16> = "Local\\MDeditor.SingleInstance\0".encode_utf16().collect();
+    let title: Vec<u16> = "MDeditor\0".encode_utf16().collect();
+    let text: Vec<u16> = "MDeditor 已在运行，请切换到已有窗口继续编辑。\0".encode_utf16().collect();
+    unsafe {
+        match CreateMutexW(None, true, PCWSTR(name.as_ptr())) {
+            Ok(handle) => {
+                // CreateMutexW 成功但对象已存在时，GetLastError 仍是 ERROR_ALREADY_EXISTS
+                let exists = GetLastError() == ERROR_ALREADY_EXISTS;
+                // HANDLE 没有 Drop 实现，句柄会一直保持到进程退出；此处不做任何关闭动作
+                let _ = handle;
+                if !exists {
+                    return true;
+                }
+                let _ = MessageBoxW(
+                    None,
+                    PCWSTR(text.as_ptr()),
+                    PCWSTR(title.as_ptr()),
+                    MB_OK | MB_ICONINFORMATION,
+                );
+                false
+            }
+            // 互斥体创建失败时放行，避免把用户彻底锁在应用外面
+            Err(_) => true,
+        }
+    }
+}
+
+#[cfg(not(windows))]
+fn acquire_single_instance() -> bool {
+    true
+}
+
 fn main() {
     // 命令行转换模式：mdeditor.exe --to-md <文件> [选项]
     if let Some(code) = cli::maybe_run_cli() {
@@ -995,6 +1055,14 @@ fn main() {
         })
         .cloned();
 
+    // --pdf-out 是无界面自动化导出，必须允许与常驻 GUI 实例并存
+    let automation = args
+        .iter()
+        .any(|a| a == "--pdf-out" || a.starts_with("--pdf-out="));
+    if !automation && !acquire_single_instance() {
+        return;
+    }
+
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .manage(AppState {
@@ -1018,6 +1086,7 @@ fn main() {
             list_dir,
             path_stat,
             path_exists,
+            file_mtime,
             create_dir,
             remove_path,
             rename_path,

@@ -120,12 +120,12 @@
     } catch (e) { MD.toast('重命名失败：' + e.message); }
   }
   async function deleteItem(p) {
-    if (!confirm(`确定删除「${U.baseName(p)}」吗？此操作不可恢复。`)) return;
+    if (!confirm(`确定删除「${U.baseName(p)}」吗？文件将移入系统回收站，可还原。`)) return;
     try {
       await MD.fsx.remove(p);
       if (state.currentFile === p) MD.bus.emit('doc:close-request');
       await renderTree();
-      MD.toast('已删除');
+      MD.toast('已移入回收站');
     } catch (e) { MD.toast('删除失败：' + e.message); }
   }
 

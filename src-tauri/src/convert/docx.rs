@@ -18,7 +18,7 @@ struct StyleInfo {
     outline: Option<u8>,
 }
 
-#[derive(Default)]
+#[derive(Default, Clone)]
 struct Run {
     text: String,
     b: bool,
@@ -282,7 +282,24 @@ fn parse_paragraph(
                     b"r" => {
                         let mut run = parse_run(r, buf);
                         let img = run.img.take();
-                        if !run.text.trim().is_empty() || run.link.is_some() {
+                        // `<w:br/>` / `<w:cr/>` 在 run 内部被记成 '\n'。直接塞进 Text 会被
+                        // 后面的 trim / 同格式合并吃掉（纯 "\n" 的 run 甚至会被判为空而丢弃），
+                        // 所以这里按换行切开，行间插入 Piece::Break 输出 Markdown 硬换行。
+                        if run.text.contains('\n') {
+                            let mut first = true;
+                            for part in run.text.split('\n') {
+                                if !first {
+                                    pieces.push(Piece::Break);
+                                }
+                                first = false;
+                                if !part.trim().is_empty() {
+                                    pieces.push(Piece::Text(Run {
+                                        text: part.to_string(),
+                                        ..run.clone()
+                                    }));
+                                }
+                            }
+                        } else if !run.text.trim().is_empty() || run.link.is_some() {
                             pieces.push(Piece::Text(run));
                         }
                         if let Some(v) = img {

@@ -391,8 +391,107 @@
         html += `<button data-theme-set="${t.id}" class="${s.docTheme === t.id ? 'checked' : ''}"><span class="theme-swatch">${swatch(t)}${U.esc(t.name)}</span></button>`;
       }
     }
-    html += '<hr><button data-act="openThemeEditor">主题编辑器…</button>';
+    html += '<hr><button data-act="importTheme">导入主题…</button>';
+    html += '<button data-act="openThemeEditor">主题编辑器…</button>';
     pop.innerHTML = html;
+  }
+
+  /* ── 主题导入 ── */
+  /** 校验导入对象并返回规范化主题；纯函数，不写入任何设置。
+   *  与 exportTheme() 导出的主题对象结构兼容：{ id, name, dark, vars, base?, extraCSS? }。
+   *  id 忽略并重新生成，避免与内置主题 / 现有自定义主题冲突。 */
+  function parseImportedTheme(raw) {
+    let obj;
+    try { obj = JSON.parse(raw); }
+    catch (e) { return { ok: false, error: '不是有效的 JSON 文件' }; }
+    if (!obj || typeof obj !== 'object' || Array.isArray(obj)) {
+      return { ok: false, error: '主题格式不正确（应为对象）' };
+    }
+    const name = typeof obj.name === 'string' ? obj.name.trim() : '';
+    if (!name) return { ok: false, error: '缺少主题名称（name）' };
+    if (!obj.vars || typeof obj.vars !== 'object' || Array.isArray(obj.vars)) {
+      return { ok: false, error: '缺少主题变量（vars 对象）' };
+    }
+    // 只接受 --doc-* 变量且值必须是字符串，过滤非字符串值与明显非法的键
+    const vars = {};
+    for (const [k, v] of Object.entries(obj.vars)) {
+      if (!/^--doc-[a-z0-9-]+$/i.test(k) || typeof v !== 'string') continue;
+      vars[k] = v;
+    }
+    if (!Object.keys(vars).length) {
+      return { ok: false, error: 'vars 中没有可用的 --doc-* 变量' };
+    }
+    const theme = {
+      name,
+      vars,
+      extraCSS: typeof obj.extraCSS === 'string' ? obj.extraCSS : '',
+      dark: !!obj.dark,
+    };
+    if (typeof obj.base === 'string' && obj.base.trim()) theme.base = obj.base.trim();
+    return { ok: true, theme };
+  }
+
+  /** 生成不与内置主题 / 现有自定义主题冲突的 id */
+  function uniqueThemeId() {
+    const builtin = new Set(BUILTIN.map((t) => t.id));
+    let id;
+    do { id = 'custom-' + U.uid(); }
+    while (builtin.has(id) || (MD.settings.customThemes && MD.settings.customThemes[id]));
+    return id;
+  }
+
+  /** 读取文件文本：File.text 不可用时回退 FileReader */
+  function readThemeFile(file) {
+    return new Promise((resolve, reject) => {
+      if (typeof file.text === 'function') { file.text().then(resolve, reject); return; }
+      const fr = new FileReader();
+      fr.onload = () => resolve(fr.result);
+      fr.onerror = () => reject(fr.error || new Error('读取文件失败'));
+      fr.readAsText(file, 'utf-8');
+    });
+  }
+
+  /**
+   * 导入主题：用隐藏的 <input type="file"> 直接拿到文件内容。
+   * 不复用 MD.fsx.pickFile —— 它返回的是路径，浏览器模式还固定只接受 markdown 类型，
+   * 且 readFile 会写入 fileMeta/编码信息，对纯 UTF-8 的 .json 主题并不合适。
+   * <input> 在 Tauri(WebView2) 与浏览器都可用，且不涉及内联脚本，严格 CSP 兼容。
+   */
+  function importTheme() {
+    const input = document.createElement('input');
+    input.type = 'file';
+    input.accept = '.json,application/json';
+    input.style.display = 'none';
+    document.body.appendChild(input);
+    const cleanup = () => { if (input.parentNode) input.parentNode.removeChild(input); };
+    input.addEventListener('change', async () => {
+      const file = input.files && input.files[0];
+      if (!file) { cleanup(); return; }   // 用户取消选择
+      try {
+        const text = await readThemeFile(file);
+        const parsed = parseImportedTheme(text);
+        if (!parsed.ok) { MD.toast('导入失败：' + parsed.error); return; }
+        // 全部校验通过后才写设置：JSON 损坏 / 结构不符 / 读写异常都不会污染现有设置
+        if (!MD.settings.customThemes || typeof MD.settings.customThemes !== 'object') {
+          MD.settings.customThemes = {};
+        }
+        const id = uniqueThemeId();
+        const theme = parsed.theme;
+        theme.id = id;
+        MD.settings.customThemes[id] = theme;
+        MD.settings.docTheme = id;
+        MD.saveSettings();
+        applyDoc();                    // 立即应用（内部会 emit theme:applied）
+        renderThemeMenu();             // 刷新主题菜单
+        MD.bus.emit('render:needed');  // 与切换主题一致：刷新代码高亮明暗配色
+        MD.toast('主题已导入：' + theme.name);
+      } catch (e) {
+        MD.toast('导入失败：' + (e && e.message ? e.message : e));
+      } finally {
+        cleanup();                     // 无论成功失败都移除临时 input，不残留节点
+      }
+    });
+    input.click();
   }
 
   /* ══════════ 排版面板 ══════════ */
@@ -896,6 +995,7 @@
     applyUI, applyDoc, resolvedVars,
     renderThemeMenu, renderLayoutPanel, renderSettings,
     openThemeEditor, closeThemeEditor, clearDraftPreview, showHelp,
+    importTheme,
     FONTS_BODY, FONTS_HEADING, FONTS_MONO,
   };
 })();
