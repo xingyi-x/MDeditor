@@ -9,9 +9,9 @@ use base64::Engine as _;
 use serde::Serialize;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
-#[cfg(debug_assertions)]
-use tauri::Manager;
+use tauri::{Emitter, Manager};
 
 // ---------- 数据结构 ----------
 
@@ -38,6 +38,23 @@ struct AppState {
     startup_file: Mutex<Option<String>>,
     /// --pdf-out <路径>：启动后自动把当前文档导出成 PDF 再退出（自测 / 批处理用）
     pdf_out: Mutex<Option<String>>,
+}
+
+/// 关闭流程的裁决权放在 Rust 侧。
+///
+/// 教训：前端一旦注册 `window.onCloseRequested`，Tauri 会把原生关闭拦下来，改由前端调用
+/// `window.destroy()` 才真正关窗；而 `capabilities/default.json` 默认不授予
+/// `core:window:allow-destroy`（`core:window:default` 的权限清单里没有它），destroy 被 ACL
+/// 拒绝后，窗口就再也关不掉 —— 点 ✕ 无反应、Alt+F4 无效，只能结束进程。
+///
+/// 现在改为：Rust 拦截 `CloseRequested` 并广播事件，前端只负责决定「直接退 / 先询问」，
+/// 最终统一走 `quit_app`（`app.exit`，不受 ACL 限制）。
+#[derive(Default)]
+struct CloseGuard {
+    /// 已确认可以关闭（前端答复完毕或强放行）
+    allowed: AtomicBool,
+    /// 上一次关闭请求时刻：1.5 秒内再次请求直接放行，保证任何情况下都能退出
+    last_req: Mutex<Option<std::time::Instant>>,
 }
 
 fn to_string_err<E: std::fmt::Display>(e: E) -> String {
@@ -666,7 +683,11 @@ fn get_pdf_target(state: tauri::State<AppState>) -> Option<String> {
 
 #[tauri::command]
 fn quit_app(app: tauri::AppHandle, code: Option<i32>) {
-    // --pdf-out 自动化导出用退出码告诉批处理脚本成功/失败
+    // 标记为「已允许关闭」再退出：即使 app.exit 之后还有一次 CloseRequested，
+    // 也不会被拦截成第二个提示。--pdf-out 自动化导出用 code 回报成功/失败。
+    if let Some(guard) = app.try_state::<CloseGuard>() {
+        guard.allowed.store(true, Ordering::SeqCst);
+    }
     app.exit(code.unwrap_or(0));
 }
 
@@ -1068,6 +1089,36 @@ fn main() {
         .manage(AppState {
             startup_file: Mutex::new(startup_file),
             pdf_out: Mutex::new(pdf_out),
+        })
+        .manage(CloseGuard::default())
+        // 关闭裁决：默认拦下并交给前端询问；前端答完调用 quit_app 才真正退出。
+        // 1.5 秒内重复请求关闭则直接放行，避免前端异常时把用户锁死在应用里。
+        .on_window_event(|window, event| {
+            let tauri::WindowEvent::CloseRequested { api, .. } = event else {
+                return;
+            };
+            let guard = window.state::<CloseGuard>();
+            if guard.allowed.load(Ordering::SeqCst) {
+                return;
+            }
+            let now = std::time::Instant::now();
+            let repeated = match guard.last_req.lock() {
+                Ok(mut last) => {
+                    let r = last
+                        .map(|t| now.duration_since(t).as_millis() < 1500)
+                        .unwrap_or(false);
+                    *last = Some(now);
+                    r
+                }
+                // 互斥锁中毒：宁可放行也不要卡住关闭
+                Err(_) => true,
+            };
+            if repeated {
+                guard.allowed.store(true, Ordering::SeqCst);
+                return;
+            }
+            api.prevent_close();
+            let _ = window.emit("app:close-requested", ());
         })
         .setup(|_app| {
             #[cfg(debug_assertions)]

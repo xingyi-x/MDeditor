@@ -228,11 +228,17 @@
     toggleTypewriter: () => setTypewriter(!MD.settings.typewriter),
     toggleFullscreen: () => toggleFullscreen(),
     openThemeEditor: () => MD.theme.openThemeEditor(),
+    clearRecent: () => { MD.panels.clearRecent(); MD.toast('已清空最近打开记录'); },
+    closeSave: () => finishClose('save'),
+    closeDiscard: () => finishClose('discard'),
+    closeCancel: () => finishClose('cancel'),
   };
   function closeModal(id) {
     const el = id && U.$('#' + id);
     if (el) el.hidden = true;
     if (id === 'theme-modal') MD.theme.clearDraftPreview();
+    // 退出确认被取消：解除状态锁，否则之后点 ✕ 会被当成重复请求忽略
+    if (id === 'close-modal') closing = false;
   }
   function bindActions() {
     document.addEventListener('click', (e) => {
@@ -655,6 +661,52 @@
     setTimeout(tick, EXTERNAL_POLL_MS);
   }
 
+  /* ══════════ 关闭流程 ══════════ */
+  // Rust 侧拦截 CloseRequested 后广播 app:close-requested，前端只做决策。
+  // 绝不再用 window.onCloseRequested：那条链路要求前端调用 window.destroy()，
+  // 而默认 capabilities 不含 core:window:allow-destroy，会导致窗口彻底关不掉。
+  let closing = false;
+
+  function bindCloseFlow() {
+    const T = window.__TAURI__ || {};
+    if (T.event && typeof T.event.listen === 'function') {
+      T.event.listen('app:close-requested', () => { onCloseRequested(); })
+        .catch((e) => console.warn('关闭事件订阅失败', e));
+    } else {
+      // 浏览器模式兜底（桌面版走原生拦截）
+      window.addEventListener('beforeunload', (e) => {
+        if (state.dirty) { e.preventDefault(); e.returnValue = ''; }
+      });
+    }
+  }
+
+  function onCloseRequested() {
+    if (closing) return;
+    if (!state.dirty) { MD.fsx.quit(); return; }   // 无未保存修改：直接退出
+    closing = true;
+    const mask = U.$('#close-modal');
+    if (mask) mask.hidden = false;
+    else MD.fsx.quit();   // 弹窗缺失时不让用户卡住
+  }
+
+  async function finishClose(action) {
+    if (action === 'cancel') {
+      closing = false;
+      closeModal('close-modal');
+      return;
+    }
+    if (action === 'save') {
+      try {
+        await MD.actions.save();          // 取消「另存为」会走到这里，dirty 保持 true
+      } catch (e) {
+        MD.toast('保存失败：' + ((e && e.message) || e));
+        return;                           // 留在窗口，绝不带着未保存内容退出
+      }
+      if (state.dirty) { MD.toast('尚未保存成功，已取消退出'); return; }
+    }
+    await MD.fsx.quit();
+  }
+
   /* ══════════ 启动 ══════════ */
   async function boot() {
     MD.loadSettings();
@@ -706,37 +758,7 @@
     MD.bus.emit('theme:applied');
     startExternalWatch();
 
-    // 关闭拦截：WebView2 里 beforeunload 不可靠，优先用 Tauri 的 onCloseRequested。
-    // 若运行时拿不到该 API，只能退回 beforeunload，此时 Rust 侧需拦截 CloseRequested 才能兜住。
-    let nativeCloseGuard = false;
-    try {
-      const T = window.__TAURI__ || {};
-      const win = T.window && T.window.getCurrentWindow
-        ? T.window.getCurrentWindow()
-        : (T.webviewWindow && T.webviewWindow.getCurrentWebviewWindow
-          ? T.webviewWindow.getCurrentWebviewWindow() : null);
-      if (win && typeof win.onCloseRequested === 'function') {
-        // 注册本身是异步的，不阻塞启动；成功后才让 beforeunload 让位
-        Promise.resolve(win.onCloseRequested(async (event) => {
-          if (!state.dirty) return;
-          event.preventDefault();
-          if (confirm('当前文档有未保存的修改，是否保存后关闭？')) {
-            await MD.actions.save();
-            // 保存失败时 dirty 仍为 true，不能静默退出丢内容
-            if (!state.dirty) await MD.fsx.quit();
-          } else if (confirm('放弃未保存的修改并关闭吗？')) {
-            await MD.fsx.quit();
-          }
-          // 两个都选「否」：取消本次关闭
-        })).then(() => { nativeCloseGuard = true; })
-          .catch((e) => console.warn('关闭拦截注册失败', e));
-      }
-    } catch (e) { console.warn('关闭拦截注册失败', e); }
-
-    window.addEventListener('beforeunload', (e) => {
-      if (nativeCloseGuard) return;   // 已由原生拦截接管，避免重复提示
-      if (state.dirty) { e.preventDefault(); e.returnValue = ''; }
-    });
+    bindCloseFlow();
 
     // 启动文件（文件关联双击打开）
     const startup = await MD.fsx.startupFile();

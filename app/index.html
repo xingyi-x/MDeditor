@@ -114,7 +114,9 @@
         <button data-act="newFileInFolder" title="在当前目录新建">＋ 新建</button>
       </div>
       <div id="filetree" class="side-list"></div>
-      <div class="side-sub">最近打开</div>
+      <div class="side-sub">最近打开
+        <button class="link-btn" data-act="clearRecent" title="清空最近打开记录">清空</button>
+      </div>
       <div id="recent-list" class="side-list"></div>
     </div>
     <div class="side-body" data-side-body="outline" hidden>
@@ -192,6 +194,21 @@
   <div class="modal">
     <header><b>快捷键</b><button class="close" data-close-panel="help-modal">✕</button></header>
     <div class="modal-body" id="help-body"></div>
+  </div>
+</div>
+
+<!-- ══════════ 退出确认（有未保存修改时） ══════════ -->
+<div class="modal-mask" id="close-modal" hidden>
+  <div class="modal modal-sm">
+    <header><b>退出 MDeditor</b><button class="close" data-close-panel="close-modal">✕</button></header>
+    <div class="modal-body">
+      <p class="modal-text">当前文档有未保存的修改。</p>
+      <div class="modal-actions btn-row">
+        <button class="btn" data-act="closeCancel">取消</button>
+        <button class="btn danger" data-act="closeDiscard">放弃并退出</button>
+        <button class="btn primary" data-act="closeSave">保存并退出</button>
+      </div>
+    </div>
   </div>
 </div>
 

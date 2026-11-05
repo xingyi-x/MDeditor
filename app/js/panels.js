@@ -135,6 +135,12 @@
     MD.saveSettings();
     renderRecent();
   }
+  /// 清空本机「最近打开」记录（数据只在本地 localStorage，不在仓库/安装包里）
+  function clearRecent() {
+    S().recentFiles = [];
+    MD.saveSettings();
+    renderRecent();
+  }
   async function renderRecent() {
     const box = U.$('#recent-list');
     let list = (S().recentFiles || []).slice();
@@ -350,7 +356,7 @@
   }
 
   MD.panels = {
-    init, renderTree, renderRecent, renderOutline, renderWelcome, pushRecent,
+    init, renderTree, renderRecent, renderOutline, renderWelcome, pushRecent, clearRecent,
     get currentFolder() { return state.currentFolder; },
     setFolder(p) { state.currentFolder = p; MD.bus.emit('folder:opened', p); },
   };

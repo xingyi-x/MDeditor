@@ -8,17 +8,17 @@
 
 | 文件 | 说明 |
 | --- | --- |
-| `MDeditor-v1.4-setup.exe` | **安装版（推荐）**：含 `.md` 文件关联、开始菜单快捷方式，可在「应用和功能」中卸载 |
+| `MDeditor-v1.4.1-setup.exe` | **安装版（推荐）**：含 `.md` 文件关联、开始菜单快捷方式，可在「应用和功能」中卸载 |
 | `MDeditor.exe` | **绿色版**：单文件免安装，双击即用（前端资源已内嵌），同时作为命令行入口 |
 | `mdconv.bat` | 命令行转换包装脚本，与 `MDeditor.exe` 放同一目录即可使用 |
 
-> 本机构建产出的安装包名为 `MDeditor-v1.4-安装包.exe`；上传 Releases 时 GitHub 会剔除文件名中的非 ASCII 字符，故下载名为 `MDeditor-v1.4-setup.exe`，两者内容一致。
+> 本机构建产出的安装包名为 `MDeditor-v1.4.1-安装包.exe`；上传 Releases 时 GitHub 会剔除文件名中的非 ASCII 字符，故下载名为 `MDeditor-v1.4.1-setup.exe`，两者内容一致。
 
 环境要求：Windows 10/11 x64 + WebView2 Runtime（Windows 11 已内置；Win10 若缺失需[单独安装](https://developer.microsoft.com/microsoft-edge/webview2/)）。
 
 **特点：**
 
-- 纯本地运行，无账号、无上传、无遥测
+- 纯本地运行，无账号、无上传、无遥测：无 HTTP 客户端依赖、前端零 CDN 引用、CSP 只放行本地与 IPC；启动后实测进程树无任何网络连接
 - 源码 / 分栏 / 预览 / 阅读 四种视图，编辑与预览同步滚动
 - **主题系统**：10 款内置文档主题（清爽白 / 暖黄护眼 / 豆沙绿 / 暗夜黑 / 仿 Word / 论文衬线 / 书卷衬线 / 极简灰 / 蓝图科技 / 樱粉），支持自定义主题编辑器（颜色 + 字体 + 附加 CSS），可导出 / **导入**为主题文件；附加 CSS 在应用内预览中也生效
 - **Word/PDF 式排版**：A4/A5/B5/Letter/16K 纸张、页边距（mm）、行距、段间距、首行缩进、两端对齐、正文/标题/代码字体、标题倍率、内容宽度；纸张模式下文档显示为真实比例的"纸"
@@ -28,7 +28,7 @@
 - **导出**：PDF（直接生成文件，**无浏览器页眉页脚**）、自包含 HTML（图片与公式字体内嵌）、Word（扩展名为 `.doc` 的 HTML，版式已扁平化）、纯文本（去掉 Markdown 记号）。
   打印与 PDF 导出按「打印友好」处理：正文、代码块、引用、表头会被强制成白底黑字，因此**彩色主题的配色不会出现在成品 PDF 里**；Word 的 HTML 对 `data:` 图片和 SVG（Mermaid）支持有限，以文字内容为准
 - **渲染能力**：GFM、任务列表（预览中可直接勾选并回写源码）、表格、代码高亮（highlight.js）、数学公式（KaTeX）、Mermaid 图表（懒加载）
-- **文件管理**：文件夹树浏览、最近打开、全局全文搜索、重命名、删除（送系统**回收站**，可还原）、在资源管理器中显示；文件被外部程序修改时自动检测（未编辑则静默重载，有未保存修改则先询问）
+- **文件管理**：文件夹树浏览、最近打开（可一键清空，记录只存本机）、全局全文搜索、重命名、删除（送系统**回收站**，可还原）、在资源管理器中显示；文件被外部程序修改时自动检测（未编辑则静默重载，有未保存修改则先询问）
 - **单实例**：再次双击不会开出第二个窗口，避免两个实例同时写同一文档
 - **拖拽打开**：把文件直接拖到窗口上即可（有「松开即打开」提示层）——  
   `.md` / `.txt` 直接打开，PDF / Word / Excel / PPT / HTML 自动转成 Markdown 后打开，图片插入当前文档
@@ -125,7 +125,7 @@ MDeditor/
 ├── .github/workflows/  CI（Rust 编译与单测、前端 JS 语法检查）
 ├── dist/               打包产物
 │   ├── MDeditor.exe              绿色版 / 命令行入口（仓库内附带）
-│   ├── MDeditor-v1.4-安装包.exe    NSIS 安装包（仅本机构建产物，Releases 下载名为 setup）
+│   ├── MDeditor-v1.4.1-安装包.exe    NSIS 安装包（仅本机构建产物，Releases 下载名为 setup）
 │   └── mdconv.bat                命令行包装脚本
 ├── _toolchain/          Rust 工具链与探针脚本（仅本机自用，可选，gitignore）
 ├── _backup/             版本快照（本地备份，gitignore）
@@ -193,6 +193,25 @@ cargo tauri build
 - **安全**：启用严格 CSP（`script-src 'self'`，移除内联脚本）；写盘命令拒绝写入启动目录与可执行文件；文件命令改后台执行并保留 panic 捕获的线程安全；`.doc` 转换的路径改用环境变量传递。
 
 已知限制（v1.4 已处理其中大部分，见下条）：CMYK 编码的 JPEG 仍按原样落盘（颜色可能反相）；JPX / CCITT 图像滤镜暂不支持；删除文件仍是永久删除（不进回收站）；单实例、外部修改检测与自动化测试尚未加入。
+
+### v1.4.1
+
+修 v1.4 引入的两个严重问题，并把「纯本地」从承诺变成可验证的事实：
+
+- **修复：窗口关不掉**。v1.4 用前端 `window.onCloseRequested` 拦截关闭，Tauri 会把原生关闭交给前端调用
+  `window.destroy()`；而默认 capabilities 不含 `core:window:allow-destroy`，destroy 被 ACL 拒绝后，
+  点 ✕、Alt+F4 全部失效，只能用任务管理器结束进程。现改为 **Rust 侧裁决**：拦截 `CloseRequested`
+  → 广播 `app:close-requested` → 前端决策（有未保存修改时弹应用内三选一：取消 / 放弃并退出 / 保存并退出）
+  → 统一调用 `app.exit`（不受 ACL 限制）。另加兜底：1.5 秒内再次请求关闭直接放行，
+  任何情况下都不会把用户锁在应用里；保存失败时留在窗口，绝不带着未保存内容退出。
+- **隐私：零云端请求（实测）**。启动后对 `mdeditor.exe` 及其 7 个 WebView2 子进程做连接采样，
+  `ESTABLISHED` / `SYN_SENT` 均为 0；代码层面无 HTTP 客户端依赖、前端无 CDN 引用、
+  CSP `connect-src` 只放行 `self` / `ipc` / `asset`。
+  唯一可能联网的环节是**安装器**：`downloadBootstrapper` 只在系统缺少 WebView2 运行时时才下载
+  运行时（Win11 与已更新的 Win10 自带，正常安装全程离线）；应用本身不发起任何网络请求。
+- **最近打开可一键清空**：侧栏「最近打开」右侧新增「清空」。该列表与其它设置只存在本机
+  `localStorage`（`%LOCALAPPDATA%\com.local.mdeditor\EBWebView\`），**不进入仓库、安装包或分发的 exe**；
+  想彻底重置可删除 `%LOCALAPPDATA%\com.local.mdeditor` 整个目录。
 
 ### v1.4
 

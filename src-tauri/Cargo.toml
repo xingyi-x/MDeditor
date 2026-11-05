@@ -1,6 +1,6 @@
 [package]
 name = "mdeditor"
-version = "1.4.0"
+version = "1.4.1"
 description = "本地 Markdown 阅读与排版编辑器"
 authors = ["local"]
 edition = "2021"
