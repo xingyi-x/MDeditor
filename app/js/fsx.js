@@ -106,6 +106,7 @@
       const r = await window.__TAURI__.dialog.open({ directory: true, multiple: false });
       return Array.isArray(r) ? r[0] : r;
     },
+    /** 文档 → Markdown。返回 { path, warnings }（旧后端只返回路径字符串） */
     async convertToMd(input, output, opt) {
       const o = opt || {};
       return invoke('convert_to_md', {

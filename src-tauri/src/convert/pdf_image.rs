@@ -568,10 +568,31 @@ fn image_bytes(doc: &lopdf::Document, stream: &lopdf::Stream) -> Option<(String,
     let dict = &stream.dict;
     let w = dict.get(b"Width").ok().and_then(obj_num).unwrap_or(0.0).max(0.0) as u32;
     let h = dict.get(b"Height").ok().and_then(obj_num).unwrap_or(0.0).max(0.0) as u32;
-    // 尺寸下限过滤项目符号级小图标，上限防止畸形 PDF 用超大尺寸耗尽内存
-    if w < MIN_W || h < MIN_H || (w as u64) * (h as u64) > MAX_IMAGE_PIXELS {
+    // 尺寸下限过滤项目符号级小图标（有意跳过，不算问题）
+    if w < MIN_W || h < MIN_H {
         return None;
     }
+    // 上限防止畸形 PDF 用超大尺寸耗尽内存
+    if (w as u64) * (h as u64) > MAX_IMAGE_PIXELS {
+        crate::convert::warn("部分图片尺寸超出处理上限，已跳过");
+        return None;
+    }
+    if filter_list(dict)
+        .iter()
+        .any(|f| matches!(f.as_str(), "CCITTFaxDecode" | "CCF" | "JPXDecode"))
+    {
+        crate::convert::warn("部分图片使用 JPX / CCITT 压缩，暂不支持，已跳过");
+        return None;
+    }
+    let r = decode_image(doc, stream, w, h);
+    if r.is_none() {
+        crate::convert::warn("部分图片解码失败或色彩空间暂不支持，已跳过");
+    }
+    r
+}
+
+fn decode_image(doc: &lopdf::Document, stream: &lopdf::Stream, w: u32, h: u32) -> Option<(String, Vec<u8>)> {
+    let dict = &stream.dict;
     let bpc = dict.get(b"BitsPerComponent").ok().and_then(obj_num).unwrap_or(8.0).max(1.0) as usize;
 
     let (payload, jpeg) = decode_filters(doc, dict, &stream.content)?;
@@ -829,12 +850,14 @@ pub(super) fn extract_images(
                 // 不会再因为都叫 p001_1.png 而互相覆盖
                 let base = format!("p{:03}_{}_{}{}", pno, idx, short_hash(&bytes), ext);
                 if !assets_ready {
-                    if fs::create_dir_all(assets_dir).is_err() {
+                    if let Err(e) = fs::create_dir_all(assets_dir) {
+                        crate::convert::warn(format!("图片目录创建失败，图片未导出：{}", e));
                         continue;
                     }
                     assets_ready = true;
                 }
-                if fs::write(assets_dir.join(&base), &bytes).is_err() {
+                if let Err(e) = fs::write(assets_dir.join(&base), &bytes) {
+                    crate::convert::warn(format!("部分图片写入失败：{}", e));
                     continue;
                 }
                 let r = format!("{}/{}", assets_rel, base);

@@ -77,8 +77,18 @@
     MD.toast('正在转换 ' + U.baseName(path) + ' …', 60000);
     try {
       const res = await MD.fsx.convertToMd(path, out, { images: true, overwrite: true });
-      MD.toast('已转换：' + U.baseName(res));
-      await openFile(res);
+      // 后端返回 { path, warnings }；兼容只返回路径字符串的旧后端
+      const outPath = res && typeof res === 'object' ? res.path : res;
+      const warns = res && Array.isArray(res.warnings) ? res.warnings : [];
+      if (warns.length) {
+        // 转换完成但结果需要核对（缺字回退、矢量图未转图片、解析中断等）：提示停留更久，完整列表进控制台
+        console.warn('转换提示：', warns);
+        const more = warns.length > 1 ? ` 等 ${warns.length} 条` : '';
+        MD.toast(`已转换：${U.baseName(outPath)}（提示：${warns[0]}${more}）`, 9000);
+      } else {
+        MD.toast('已转换：' + U.baseName(outPath));
+      }
+      await openFile(outPath);
     } catch (e) {
       MD.toast('转换失败：' + (e && e.message ? e.message : e));
     }
@@ -470,7 +480,9 @@ ${wordMode ? '' : `<div style="text-align:center;color:#9ca3af;font-size:12px;ma
     try {
       const lexer = window.marked && window.marked.lexer;
       if (!lexer) return md;
-      walk(lexer(md));
+      // YAML 元信息不是正文，纯文本里不要
+      const body = MD.md && MD.md.stripFrontMatter ? MD.md.stripFrontMatter(md) : md;
+      walk(lexer(body));
     } catch (e) {
       console.warn('纯文本转换失败，回退为原文', e);
       return md;

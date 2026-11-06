@@ -4,7 +4,7 @@
  *
  * 因为是 GUI 子系统的 exe（双击不弹黑框），命令行模式下需要主动附加到父控制台输出。
  */
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use crate::convert;
@@ -211,16 +211,33 @@ fn run(args: Vec<String>) -> i32 {
     let mut used: HashSet<PathBuf> = HashSet::new();
     for f in &files {
         let out_path = target_path(f, &o, files.len() == 1, &mut used);
-        match convert::convert_file_to_string(f, &out_path, &opts) {
+        // pdf-extract 遇到缺字会直接 println!：转换期间把标准输出截到临时文件，
+        // 否则 `--stdout` 输出的 Markdown 前面会混进成百上千行诊断
+        #[cfg(windows)]
+        let capture = con::capture_stdout();
+        let result = convert::convert_file(f, &out_path, &opts);
+        #[cfg(windows)]
+        let captured = capture.map(|c| c.finish()).unwrap_or_default();
+        #[cfg(not(windows))]
+        let captured = String::new();
+        match result {
             Err(e) => {
                 failed += 1;
                 emit(&format!("[失败] {} — {}", f.display(), e));
             }
-            Ok(mut md) => {
+            Ok(mut conv) => {
+                conv.warnings.extend(summarize_captured(&captured));
                 // front matter 只对转换出来的格式有意义；原样透传的 md/markdown 不加
                 if opts.front_matter && !convert::is_passthrough_ext(&convert::ext_of(f)) {
-                    md = convert::front_matter_of(f, &md);
+                    conv.md = convert::front_matter_of(f, &conv.md, &conv.meta);
                 }
+                // 提示一律走 stderr：转换成功但结果需要核对，不影响退出码
+                if !o.quiet {
+                    for w in &conv.warnings {
+                        emit(&format!("[提示] {} — {}", f.display(), w));
+                    }
+                }
+                let md = conv.md;
                 if o.stdout {
                     emit_out(&md);
                     ok += 1;
@@ -262,6 +279,44 @@ fn run(args: Vec<String>) -> i32 {
     } else {
         0
     }
+}
+
+/// 依赖库（pdf-extract）在转换时直接 println! 的诊断，聚合成几条提示。
+/// 典型的是 `missing char 149 in unicode map {…}`：字体的 ToUnicode 表缺字，
+/// 库会退回按字体编码解码（实测项目符号 • 仍能正确输出），逐条打印只会刷屏。
+fn summarize_captured(text: &str) -> Vec<String> {
+    let mut codes: BTreeMap<String, usize> = BTreeMap::new();
+    let mut other = 0usize;
+    for line in text.lines() {
+        let t = line.trim();
+        if t.is_empty() {
+            continue;
+        }
+        if let Some(rest) = t.strip_prefix("missing char ") {
+            let code = rest.split_whitespace().next().unwrap_or("?").to_string();
+            *codes.entry(code).or_insert(0) += 1;
+        } else {
+            other += 1;
+        }
+    }
+    let mut out = Vec::new();
+    if !codes.is_empty() {
+        let total: usize = codes.values().sum();
+        let detail = codes
+            .iter()
+            .take(8)
+            .map(|(c, n)| format!("{} ×{}", c, n))
+            .collect::<Vec<_>>()
+            .join("，");
+        out.push(format!(
+            "PDF 字体的 Unicode 映射表缺字 {} 处（字符码 {}），已按字体编码回退，请核对项目符号等特殊字符",
+            total, detail
+        ));
+    }
+    if other > 0 {
+        out.push(format!("PDF 解析库输出了 {} 行诊断信息，已从标准输出移除", other));
+    }
+    out
 }
 
 fn target_path(f: &Path, o: &Opts, single: bool, used: &mut HashSet<PathBuf>) -> PathBuf {
@@ -434,5 +489,69 @@ mod con {
 
     pub fn flush() {
         // 附加的控制台在进程退出后自动释放，这里无需额外处理
+    }
+
+    /// 转换期间把进程的标准输出句柄临时指向一个临时文件。
+    /// Rust 标准库每次写 stdout 都会重新取 GetStdHandle，所以替换句柄就能截走依赖库的 println!。
+    /// 命令行模式是单线程、逐个文件串行转换，这里的进程级替换不会和别的转换互相干扰；
+    /// 真正的 Markdown 在还原句柄之后才输出。
+    pub struct Capture {
+        saved: *mut c_void,
+        path: std::path::PathBuf,
+        file: Option<std::fs::File>,
+    }
+
+    pub fn capture_stdout() -> Option<Capture> {
+        use std::os::windows::io::AsRawHandle;
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let path = std::env::temp_dir().join(format!(
+            "mdeditor-stdout-{}-{}.log",
+            std::process::id(),
+            stamp
+        ));
+        let file = std::fs::File::create(&path).ok()?;
+        let _ = std::io::Write::flush(&mut std::io::stdout());
+        unsafe {
+            let saved = GetStdHandle(STD_OUTPUT_HANDLE);
+            if SetStdHandle(STD_OUTPUT_HANDLE, file.as_raw_handle() as *mut c_void) == 0 {
+                drop(file);
+                let _ = std::fs::remove_file(&path);
+                return None;
+            }
+            Some(Capture { saved, path, file: Some(file) })
+        }
+    }
+
+    impl Capture {
+        /// 还原标准输出，取回截获的内容；临时文件随即删除
+        pub fn finish(mut self) -> String {
+            self.restore();
+            let bytes = std::fs::read(&self.path).unwrap_or_default();
+            let _ = std::fs::remove_file(&self.path);
+            String::from_utf8_lossy(&bytes).into_owned()
+        }
+
+        fn restore(&mut self) {
+            if let Some(file) = self.file.take() {
+                let _ = std::io::Write::flush(&mut std::io::stdout());
+                unsafe {
+                    SetStdHandle(STD_OUTPUT_HANDLE, self.saved);
+                }
+                drop(file);
+            }
+        }
+    }
+
+    impl Drop for Capture {
+        // 转换中途 panic 或提前返回时也要把标准输出还回去
+        fn drop(&mut self) {
+            if self.file.is_some() {
+                self.restore();
+                let _ = std::fs::remove_file(&self.path);
+            }
+        }
     }
 }

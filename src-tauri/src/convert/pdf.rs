@@ -56,6 +56,10 @@ struct Line {
     quote_head: bool,
     /// 框里装的是代码（示例框），输出成围栏代码块而不是引用段落
     quote_code: bool,
+    /// 矢量图的图题（值为图编号，0 = 不是图题）。图内文字收进折叠块，紧跟图题输出
+    fig_caption: u32,
+    /// 与 PDF 书签标题一致时的书签层级（0 = 不是书签标题）
+    outline_level: u8,
 }
 
 struct Dev {
@@ -166,6 +170,8 @@ impl Dev {
             quote: 0,
             quote_head: false,
             quote_code: false,
+            fig_caption: 0,
+            outline_level: 0,
         });
     }
 
@@ -377,6 +383,197 @@ fn page_geom(doc: &lopdf::Document, page_id: lopdf::ObjectId) -> (f64, f64, i64)
     (w, h, rot)
 }
 
+/* ────────── 书签（大纲）与文档信息 ────────── */
+
+fn dict_of<'a>(doc: &'a lopdf::Document, o: &'a lopdf::Object) -> Option<&'a lopdf::Dictionary> {
+    resolve(doc, o).as_dict().ok()
+}
+
+/// PDFDocEncoding 里 0x80..=0xA0 这一段与 Latin-1 不同，其余字节按 Latin-1 解释
+fn pdfdoc_char(c: u8) -> char {
+    const HIGH: [char; 33] = [
+        '\u{2022}', '\u{2020}', '\u{2021}', '\u{2026}', '\u{2014}', '\u{2013}', '\u{0192}',
+        '\u{2044}', '\u{2039}', '\u{203A}', '\u{2212}', '\u{2030}', '\u{201E}', '\u{201C}',
+        '\u{201D}', '\u{2018}', '\u{2019}', '\u{201A}', '\u{2122}', '\u{FB01}', '\u{FB02}',
+        '\u{0141}', '\u{0152}', '\u{0160}', '\u{0178}', '\u{017D}', '\u{0131}', '\u{0142}',
+        '\u{0153}', '\u{0161}', '\u{017E}', '\u{FFFD}', '\u{20AC}',
+    ];
+    if (0x80..=0xA0).contains(&c) {
+        HIGH[(c - 0x80) as usize]
+    } else {
+        c as char
+    }
+}
+
+/// PDF 文本字符串（书签标题、文档信息）：UTF-16（带 BOM）/ UTF-8（带 BOM）/ PDFDocEncoding
+fn decode_pdf_text(b: &[u8]) -> String {
+    if b.len() >= 2 && (b[0] == 0xFE && b[1] == 0xFF || b[0] == 0xFF && b[1] == 0xFE) {
+        let be = b[0] == 0xFE;
+        let units: Vec<u16> = b[2..]
+            .chunks(2)
+            .map(|c| {
+                let pair = [c[0], c.get(1).copied().unwrap_or(0)];
+                if be {
+                    u16::from_be_bytes(pair)
+                } else {
+                    u16::from_le_bytes(pair)
+                }
+            })
+            .collect();
+        return String::from_utf16_lossy(&units);
+    }
+    if b.len() >= 3 && b[0] == 0xEF && b[1] == 0xBB && b[2] == 0xBF {
+        return String::from_utf8_lossy(&b[3..]).into_owned();
+    }
+    b.iter().map(|&c| pdfdoc_char(c)).collect()
+}
+
+/// 空白（含换行、制表符）压缩成单个空格
+fn collapse_ws(s: &str) -> String {
+    s.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// 命名目标：`/Root /Dests`（PDF 1.1 字典）与 `/Root /Names /Dests`（名字树）合在一起
+fn named_dests<'a>(
+    doc: &'a lopdf::Document,
+    root: &'a lopdf::Dictionary,
+) -> HashMap<Vec<u8>, &'a lopdf::Object> {
+    let mut map: HashMap<Vec<u8>, &'a lopdf::Object> = HashMap::new();
+    if let Some(d) = root.get(b"Dests").ok().and_then(|o| dict_of(doc, o)) {
+        for (k, v) in d.iter() {
+            map.insert(k.clone(), v);
+        }
+    }
+    let tree = root
+        .get(b"Names")
+        .ok()
+        .and_then(|o| dict_of(doc, o))
+        .and_then(|n| n.get(b"Dests").ok())
+        .and_then(|o| dict_of(doc, o));
+    let mut stack: Vec<&'a lopdf::Dictionary> = tree.into_iter().collect();
+    let mut visited = 0usize;
+    while let Some(node) = stack.pop() {
+        visited += 1;
+        if visited > 100_000 {
+            break;
+        }
+        if let Ok(arr) = node.get(b"Names").and_then(|o| resolve(doc, o).as_array()) {
+            for pair in arr.chunks(2) {
+                if let [k, v] = pair {
+                    if let lopdf::Object::String(key, _) = resolve(doc, k) {
+                        map.insert(key.clone(), v);
+                    }
+                }
+            }
+        }
+        if let Ok(kids) = node.get(b"Kids").and_then(|o| resolve(doc, o).as_array()) {
+            for kid in kids {
+                if let Some(d) = dict_of(doc, kid) {
+                    stack.push(d);
+                }
+            }
+        }
+    }
+    map
+}
+
+/// 书签目标 → 页码（1 起）。支持显式目标数组、命名目标、带 /D 的字典
+fn dest_page(
+    doc: &lopdf::Document,
+    d: &lopdf::Object,
+    names: &HashMap<Vec<u8>, &lopdf::Object>,
+    page_no: &HashMap<lopdf::ObjectId, u32>,
+    depth: u8,
+) -> Option<u32> {
+    if depth > 4 {
+        return None;
+    }
+    match resolve(doc, d) {
+        lopdf::Object::Array(a) => match a.first()? {
+            lopdf::Object::Reference(id) => page_no.get(id).copied(),
+            lopdf::Object::Integer(n) => u32::try_from(*n).ok().map(|n| n + 1),
+            _ => None,
+        },
+        lopdf::Object::Name(n) | lopdf::Object::String(n, _) => {
+            let target: &lopdf::Object = names.get(n.as_slice())?;
+            dest_page(doc, target, names, page_no, depth + 1)
+        }
+        lopdf::Object::Dictionary(dd) => {
+            let inner = dd.get(b"D").ok()?;
+            dest_page(doc, inner, names, page_no, depth + 1)
+        }
+        _ => None,
+    }
+}
+
+/// 读取 PDF 书签：[(层级，1 起；标题；目标页，1 起，解析不出为 0)]，按文档顺序
+fn read_outline(doc: &lopdf::Document) -> Vec<(u8, String, u32)> {
+    let mut out: Vec<(u8, String, u32)> = Vec::new();
+    let page_no: HashMap<lopdf::ObjectId, u32> =
+        doc.get_pages().into_iter().map(|(n, id)| (id, n)).collect();
+    let Some(root) = doc.trailer.get(b"Root").ok().and_then(|o| dict_of(doc, o)) else {
+        return out;
+    };
+    let Some(outlines) = root.get(b"Outlines").ok().and_then(|o| dict_of(doc, o)) else {
+        return out;
+    };
+    let Ok(first) = outlines.get(b"First").and_then(|o| o.as_reference()) else {
+        return out;
+    };
+    let names = named_dests(doc, root);
+    // 深度优先：先压兄弟再压孩子，出栈顺序就是文档顺序
+    let mut stack: Vec<(lopdf::ObjectId, u8)> = vec![(first, 1)];
+    let mut seen: HashSet<lopdf::ObjectId> = HashSet::new();
+    while let Some((id, level)) = stack.pop() {
+        if out.len() >= 50_000 || !seen.insert(id) {
+            continue;
+        }
+        let Ok(item) = doc.get_dictionary(id) else { continue };
+        if let Ok(next) = item.get(b"Next").and_then(|o| o.as_reference()) {
+            stack.push((next, level));
+        }
+        if level < 32 {
+            if let Ok(child) = item.get(b"First").and_then(|o| o.as_reference()) {
+                stack.push((child, level + 1));
+            }
+        }
+        let title = match item.get(b"Title").map(|o| resolve(doc, o)) {
+            Ok(lopdf::Object::String(b, _)) => collapse_ws(&decode_pdf_text(b)),
+            _ => String::new(),
+        };
+        if title.is_empty() {
+            continue;
+        }
+        let dest = item.get(b"Dest").ok().or_else(|| {
+            item.get(b"A")
+                .ok()
+                .and_then(|a| dict_of(doc, a))
+                .and_then(|a| a.get(b"D").ok())
+        });
+        let page = dest
+            .and_then(|d| dest_page(doc, d, &names, &page_no, 0))
+            .unwrap_or(0);
+        out.push((level, title, page));
+    }
+    out
+}
+
+/// 文档信息字典里的标题（`/Info /Title`）
+fn info_title(doc: &lopdf::Document) -> Option<String> {
+    let info = doc.trailer.get(b"Info").ok().and_then(|o| dict_of(doc, o))?;
+    match resolve(doc, info.get(b"Title").ok()?) {
+        lopdf::Object::String(b, _) => {
+            let t = collapse_ws(&decode_pdf_text(b));
+            if t.is_empty() {
+                None
+            } else {
+                Some(t)
+            }
+        }
+        _ => None,
+    }
+}
+
 #[derive(Default)]
 /// 引用 / 提示框的显示坐标矩形（左上角 + 右下角，y 向下）
 #[derive(Clone, Copy)]
@@ -398,6 +595,11 @@ pub(super) struct PageMeta {
     boxes: HashMap<u32, Vec<Rect>>,
     /// 文档是否带结构标签。带标签时只认标签，避免几何猜测误伤
     tagged: bool,
+    /// 页 → 所有描边 / 填充路径的显示坐标包围盒。矢量图（框图、示意图）只存在于图形层，
+    /// 靠它们才能圈出图的范围，把图内的碎片文字与正文分开
+    graphics: HashMap<u32, Vec<Rect>>,
+    /// PDF 书签：(层级，1 起；标题；目标页，1 起)。用来确定标题层级
+    pub(super) outline: Vec<(u8, String, u32)>,
 }
 
 /// 扫描每页 content stream 的 `q / Q / cm / Do / 路径 / 结构标记`。
@@ -412,12 +614,15 @@ fn scan_pages(doc: &lopdf::Document) -> PageMeta {
         let (w, h, rot) = page_geom(doc, pid);
         meta.rotations.insert(pno, rot);
         let Ok(content) = doc.get_page_content(pid) else { continue };
-        let (draws, paths) = scan_ops(&content, w, h, rot);
+        let (draws, paths, graphics) = scan_ops(&content, w, h, rot);
         if paths.iter().any(|p| p.lbl || p.quote) {
             meta.tagged = true;
         }
         if !draws.is_empty() {
             meta.draws.insert(pno, draws);
+        }
+        if !graphics.is_empty() {
+            meta.graphics.insert(pno, graphics);
         }
         raw.insert(pno, (paths, w));
     }
@@ -565,9 +770,11 @@ fn scan_ops(
     page_w: f64,
     page_h: f64,
     rot: i64,
-) -> (Vec<(f64, String)>, Vec<PathMark>) {
+) -> (Vec<(f64, String)>, Vec<PathMark>, Vec<Rect>) {
     let mut out: Vec<(f64, String)> = Vec::new();
     let mut paths: Vec<PathMark> = Vec::new();
+    // 描边与填充一视同仁的包围盒（含零宽的直线），只用于圈定矢量图范围
+    let mut graphics: Vec<Rect> = Vec::new();
     let mut stack: Vec<Mat> = Vec::new();
     let mut ctm = Mat::id();
     let mut nums: Vec<f64> = Vec::new();
@@ -755,10 +962,24 @@ fn scan_ops(
                                     quote: tags.iter().any(|t| t == "BlockQuote"),
                                 });
                             }
+                            if (dx1 - dx0).max(dy1 - dy0) > 0.5 {
+                                graphics.push(Rect { x0: dx0, y0: dy0, x1: dx1, y1: dy1 });
+                            }
                         }
                         nums.clear();
                     }
-                    "n" | "N" | "S" | "s" => {
+                    /* ── 描边：只记进 graphics（框图的连线、外框常是描边画的） ── */
+                    "S" | "s" => {
+                        if let Some((px0, py0, px1, py1)) = pbox.take() {
+                            let (dx0, dy0, dx1, dy1) =
+                                dev_rect(&ctm, px0, py0, px1, py1, rot, page_w, page_h);
+                            if (dx1 - dx0).max(dy1 - dy0) > 0.5 {
+                                graphics.push(Rect { x0: dx0, y0: dy0, x1: dx1, y1: dy1 });
+                            }
+                        }
+                        nums.clear();
+                    }
+                    "n" | "N" => {
                         pbox = None;
                         nums.clear();
                     }
@@ -809,7 +1030,7 @@ fn scan_ops(
         }
     }
     out.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
-    (out, paths)
+    (out, paths, graphics)
 }
 
 pub(super) fn is_ws(b: u8) -> bool {
@@ -857,7 +1078,17 @@ pub fn convert(data: &[u8], ctx: &Ctx) -> Result<String, String> {
             let _ = d.decrypt("");
         }
     }
-    let meta = ldoc.as_ref().map(scan_pages).unwrap_or_default();
+    let mut meta = ldoc.as_ref().map(scan_pages).unwrap_or_default();
+    let total_pages = ldoc.as_ref().map(|d| d.get_pages().len()).unwrap_or(0);
+    if let Some(d) = ldoc.as_ref() {
+        meta.outline = read_outline(d);
+        if let Some(t) = info_title(d) {
+            crate::convert::note_meta("pdf_title", t);
+        }
+        if total_pages > 0 {
+            crate::convert::note_meta("pages", total_pages.to_string());
+        }
+    }
 
     let mut dev = Dev::new(meta.rotations.clone());
     /* pdf-extract 内部有多处 expect（`missing object reference`、`wrong type`、
@@ -875,9 +1106,22 @@ pub fn convert(data: &[u8], ctx: &Ctx) -> Result<String, String> {
     match extracted {
         Ok(Ok(())) => {}
         Ok(Err(e)) => return Err(format!("PDF 文本提取失败：{}", e)),
-        Err(_) => { /* 上游 panic：已解析的页仍然保留 */ }
+        Err(_) => {
+            // 上游 panic：已解析的页仍然保留，但必须告诉调用方结果不完整
+            crate::convert::warn(if total_pages > 0 {
+                format!(
+                    "PDF 解析在第 {} 页附近中断（共 {} 页），之后的内容缺失",
+                    dev.page, total_pages
+                )
+            } else {
+                format!("PDF 解析在第 {} 页附近中断，之后的内容缺失", dev.page)
+            });
+        }
     }
     dev.flush();
+    if dev.lines.is_empty() {
+        crate::convert::warn("没有提取到任何文字：可能是扫描版（图片型）PDF，需要先做 OCR");
+    }
 
     if let Ok(p) = std::env::var("MD_PDF_TRACE") {
         let only: Option<u32> = std::env::var("MD_PDF_TRACE_PAGE")
@@ -930,16 +1174,23 @@ fn segments_of(l: &Line) -> Vec<(f64, String)> {
     let em = l.size.max(1.0);
     let mut out: Vec<(f64, String)> = Vec::new();
     let mut cur_end = f64::MIN;
+    // 上一片段末尾带空白字形。片段要 trim 之后再拼，不单独记住就会丢掉这个空格：
+    // `"microcontrollers "` + `"based on"` 会粘成 `microcontrollersbased on`
+    let mut prev_ws_tail = false;
 
     for s in &l.segs {
         let raw = s.text.as_str();
         let piece = raw.trim();
         if piece.is_empty() {
+            if !raw.is_empty() {
+                prev_ws_tail = true;
+            }
             continue;
         }
         // 文本片段自带前导空白 = PDF 在这里画了一个空格字形，拼回去时必须保留，
         // 只靠坐标间隙会被字宽误差吃掉（0.15em 的词间距会算成 0.46em 的"紧邻"）
         let ws_head = raw.starts_with(char::is_whitespace);
+        let ws_tail = raw.ends_with(char::is_whitespace);
         if let Some(last) = out.last_mut() {
             let gap = s.x - cur_end;
             // 汉字之间被拉开是两端对齐的副产物，不是列边界
@@ -949,16 +1200,21 @@ fn segments_of(l: &Line) -> Vec<(f64, String)> {
             );
             let limit = if wide_pair { em * 2.6 } else { em * 1.5 };
             if gap <= limit {
-                if !wide_pair && !last.1.ends_with(' ') && (ws_head || gap > em * 0.55) {
+                if !wide_pair
+                    && !last.1.ends_with(' ')
+                    && (ws_head || prev_ws_tail || gap > em * 0.55)
+                {
                     last.1.push(' ');
                 }
                 last.1.push_str(piece);
                 cur_end = s.end;
+                prev_ws_tail = ws_tail;
                 continue;
             }
         }
         out.push((s.x, piece.to_string()));
         cur_end = s.end;
+        prev_ws_tail = ws_tail;
     }
     out
 }
@@ -1028,6 +1284,10 @@ fn has_column_jump(l: &Line) -> bool {
 
 /// 把一行拆成表格单元格（逻辑段数在 2~6 之间才算候选）
 fn table_cells(l: &Line) -> Option<Vec<(f64, String)>> {
+    // 图题自成一段，不能被当成表格行吞进相邻的表格
+    if l.fig_caption != 0 {
+        return None;
+    }
     let segs = segments_of(l);
     if segs.len() < 2 || segs.len() > 8 {
         return None;
@@ -1130,6 +1390,88 @@ fn render_table(rows: &[Vec<String>]) -> String {
         }
     }
     out
+}
+
+/// 把一段文字拼进单元格。以项目符号开头的续行另起一行（`<br>`），保留单元格里的列表结构；
+/// 圆点后补一个空格 —— PDF 里圆点和正文之间靠定位拉开，文字层没有空格（`•Reading`）。
+fn join_cell(slot: &mut String, t: &str) {
+    let t = t.trim();
+    if t.is_empty() {
+        return;
+    }
+    let mut it = t.chars();
+    let first = it.next().unwrap_or(' ');
+    let bullet = is_bullet_char(first);
+    if !slot.is_empty() {
+        slot.push_str(if bullet { "<br>" } else { " " });
+    }
+    if bullet {
+        slot.push(first);
+        slot.push(' ');
+        slot.push_str(it.as_str().trim_start());
+    } else {
+        slot.push_str(t);
+    }
+}
+
+/// 按列网格切好的一行 → 单元格（统一经过 join_cell 整理圆点）
+fn row_of(cells: &[String], cols: usize) -> Vec<String> {
+    let mut row = vec![String::new(); cols.max(cells.len()).max(1)];
+    for (k, c) in cells.iter().enumerate() {
+        join_cell(&mut row[k], c);
+    }
+    row
+}
+
+/// 回扫时暂存的续行是**自下而上**收集的，拼回单元格时要恢复成自上而下的阅读顺序
+fn append_pending(row: &mut [String], pend: &mut Vec<(usize, String)>) {
+    for (k, t) in pend.drain(..).rev() {
+        if let Some(slot) = row.get_mut(k) {
+            join_cell(slot, &t);
+        }
+    }
+}
+
+/// 列优先排版的一行：首列的多行标签（同样自下而上收集）+ 暂存的续行
+fn label_row(label: &mut Vec<String>, pend: &mut Vec<(usize, String)>, cols: usize) -> Vec<String> {
+    let mut row = vec![String::new(); cols.max(1)];
+    for t in label.drain(..).rev() {
+        join_cell(&mut row[0], &t);
+    }
+    append_pending(&mut row, pend);
+    row
+}
+
+/// 正向扫描时识别「列优先」的表格行：从 idx 起连续几行只有首列有字（多行标签），
+/// 紧接着的下一行只在非首列有字、且纵向回到了标签首行附近 ——
+/// PDF 先画完左列的 `Unimplemented, / Reserved`，再从同一行顶部画右列的说明。
+/// 返回标签行数；不是这种形态返回 0。
+fn column_first_labels(all: &[Line], idx: usize, grid: &[f64], head_x: f64, size: f64) -> usize {
+    let Some(first) = all.get(idx) else { return 0 };
+    let mut n = 0usize;
+    let mut last_y = f64::MIN;
+    while idx + n < all.len() && n < 6 {
+        let l = &all[idx + n];
+        if l.page != first.page || (l.size - size).abs() > 0.8 || l.fig_caption != 0 {
+            return 0;
+        }
+        let cells = cut_by_grid(l, grid);
+        let filled: Vec<usize> = (0..cells.len()).filter(|k| !cells[*k].is_empty()).collect();
+        if filled.len() == 1 && filled[0] == 0 {
+            let fx = l.chars.first().map(|c| c.0).unwrap_or(-1.0);
+            if (fx - head_x).abs() > 5.0 || l.y < last_y {
+                return 0;
+            }
+            last_y = l.y;
+            n += 1;
+            continue;
+        }
+        // 第一条非标签行：只能落在非首列，而且必须回到标签首行的高度
+        let back_to_top = l.y <= first.y + size * 0.6;
+        let ok = n > 0 && !filled.is_empty() && filled[0] != 0 && back_to_top;
+        return if ok { n } else { 0 };
+    }
+    0
 }
 
 /* ────────── 断句判断 ────────── */
@@ -1275,33 +1617,37 @@ fn looks_like_page_number(t: &str) -> bool {
         || (s2.contains('/') && s2.chars().all(|c| c.is_ascii_digit() || c == '/'))
 }
 
-/// 目录行：`标题 ………… 12` → (标题, 页码)
+/// 目录行：`标题 ………… 12`、`标题 ........ 1-52`、`标题 ........ TOC-1` → (标题, 页标)
 fn toc_entry(t: &str) -> Option<(String, String)> {
     let s = t.trim();
     let chars: Vec<char> = s.chars().collect();
     let mut i = chars.len();
-    while i > 0 && chars[i - 1].is_ascii_digit() {
+    while i > 0 && (chars[i - 1].is_ascii_alphanumeric() || chars[i - 1] == '-') {
         i -= 1;
     }
     if i == chars.len() || i == 0 {
         return None;
     }
     let page: String = chars[i..].iter().collect();
+    if !is_page_label(&page) {
+        return None;
+    }
     let head: String = chars[..i].iter().collect();
     let head_t = head.trim_end();
     let dots = head_t
         .chars()
         .rev()
-        .take_while(|c| matches!(c, '.' | '·' | '…' | ' '))
+        .take_while(|c| is_dot_char(*c) || *c == ' ')
+        .filter(|c| is_dot_char(*c))
         .count();
     if dots < 3 {
         return None;
     }
     let title = head_t
-        .trim_end_matches(|c| matches!(c, '.' | '·' | '…' | ' '))
+        .trim_end_matches(|c: char| is_dot_char(c) || c == ' ')
         .trim()
         .to_string();
-    if title.is_empty() || title.chars().count() > 80 {
+    if title.is_empty() || title.chars().count() > 200 {
         return None;
     }
     Some((title, page))
@@ -1509,6 +1855,10 @@ struct Block {
     quote_head: bool,
     /// 框内是代码
     quote_code: bool,
+    /// 书签层级（0 = 不是书签标题）
+    level: u8,
+    /// 矢量图的图题（图编号，0 = 不是图题）
+    fig: u32,
 }
 
 fn raw_level_of(size: f64, body: f64) -> u8 {
@@ -1527,6 +1877,55 @@ fn raw_level_of(size: f64, body: f64) -> u8 {
 /// 页面上下边缘区域（页眉 / 页脚）
 fn in_margin(l: &Line) -> bool {
     l.y < l.page_h * 0.09 || l.y > l.page_h * 0.91
+}
+
+/// 页眉页脚的比对键：数字串统一成 `#`，空白压缩成一个空格
+fn edge_key(t: &str) -> String {
+    let mut out = String::with_capacity(t.len());
+    let mut in_digits = false;
+    let mut space = false;
+    for c in t.trim().chars() {
+        if c.is_whitespace() {
+            space = true;
+            in_digits = false;
+            continue;
+        }
+        if space && !out.is_empty() {
+            out.push(' ');
+        }
+        space = false;
+        if c.is_ascii_digit() {
+            if !in_digits {
+                out.push('#');
+            }
+            in_digits = true;
+        } else {
+            in_digits = false;
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// 某一页上的边缘行是否属于页眉页脚：
+///   · 出现在 ≥2 个不同页、且覆盖半数以上的页（全书统一的页眉页脚）；
+///   · 或者含字母、且前后 4 页内至少还有 2 页在**同一高度**（±3pt）出现 ——
+///     章节页眉、带页码的页脚都套用固定版式，位置纹丝不动；
+///     脚注也可能落在页面底部区域、甚至连续几页内容相同，但它的高度随正文长短变化，靠这一条区分。
+///     纯数字的行不走这一条，交给 looks_like_page_number。
+fn is_running_edge(key: &str, seen: &BTreeMap<u32, f64>, page: u32, y: f64, pages: u32) -> bool {
+    if seen.len() >= 2 && (seen.len() as f64) >= pages as f64 * 0.5 {
+        return true;
+    }
+    if !key.chars().any(|c| c.is_alphabetic()) {
+        return false;
+    }
+    let lo = page.saturating_sub(4);
+    let hi = page.saturating_add(4);
+    seen.range(lo..=hi)
+        .filter(|(p, py)| **p != page && (**py - y).abs() <= 3.0)
+        .count()
+        >= 2
 }
 
 /// 内容流顺序异常时整页文字是倒着输出的（`/Rotate 180` 的页最典型）。
@@ -1690,63 +2089,196 @@ fn apply_struct(all: &mut [Line], meta: &PageMeta) {
     }
 }
 
-/// 目录行里的记号：一段正文，或一段点线引导符（其后可能紧跟页码）。
-enum DotTok {
-    Text(String),
-    Dots(Option<String>),
+/* ────────── 目录：点线引导符、页标与折行 ────────── */
+
+fn is_dot_char(c: char) -> bool {
+    matches!(c, '.' | '·' | '…' | '．')
 }
 
-/// 把一行按「点线引导符」切成记号流。
+/// 目录页标：`12`、`1-52`、`TOC-1`、`Preface-1`、`RevisionHistory-3`。
+/// 必须含数字且以数字结尾 —— 标题里的 `2nd`、`16bit` 不算页码。
+fn is_page_label(t: &str) -> bool {
+    if t.is_empty() || t.chars().count() > 24 || t.starts_with('-') {
+        return false;
+    }
+    let mut digit = false;
+    for c in t.chars() {
+        if c.is_ascii_digit() {
+            digit = true;
+        } else if !(c.is_ascii_alphabetic() || c == '-') {
+            return false;
+        }
+    }
+    digit && t.ends_with(|c: char| c.is_ascii_digit())
+}
+
+/// 没有点线也能单独认定的页标：只认带连字符的「章-页」形态（`25-3`、`TOC-1`）。
+/// 纯数字太容易和标题末尾的数字（`… 2 Radar SPUs`）混淆。
+fn is_strong_label(t: &str) -> bool {
+    t.contains('-') && is_page_label(t)
+}
+
+/// 行首是不是章节编号（`1 `、`2.1 `、`19.2.8.22 `）
+fn starts_with_section_number(s: &str) -> bool {
+    let mut it = s.chars();
+    match it.next() {
+        Some(c) if c.is_ascii_digit() => {}
+        _ => return false,
+    }
+    for c in it {
+        if c.is_ascii_digit() || c == '.' {
+            continue;
+        }
+        return c.is_whitespace();
+    }
+    false
+}
+
+/// 是否含目录点线：连续的点号至少 4 个，允许夹空格（`. . . .` 和 `....` 都算）
+/// 目录点线的计数：`…`（U+2026）**只能算 1 个**。
+/// 中文正文里的省略号就是两个 `…` 连写（`……`），按 3 个点算会凑满 4 点阈值，
+/// 于是整段正文被当成目录行重排，省略号在重排时消失（实测《非暴力沟通》丢了几十处）。
+/// 真正的目录引导符用的是句点 `. . . .`，或者四个以上的 `…`。
+fn has_leader(t: &str) -> bool {
+    let mut dots = 0usize;
+    let mut ell = 0usize;
+    for c in t.chars() {
+        if is_dot_char(c) {
+            if c == '…' {
+                ell += 1;
+            } else {
+                dots += 1;
+            }
+            if dots >= 4 || ell >= 4 {
+                return true;
+            }
+        } else if c != ' ' {
+            dots = 0;
+            ell = 0;
+        }
+    }
+    false
+}
+
+/// 目录行里的记号
+enum TocTok {
+    Text(String),
+    /// 点线引导符
+    Leader,
+    /// 页标
+    Page(String),
+}
+
+fn flush_toc_text(out: &mut Vec<TocTok>, txt: &mut String) {
+    let t = txt.trim();
+    if !t.is_empty() {
+        out.push(TocTok::Text(t.to_string()));
+    }
+    txt.clear();
+}
+
+/// 把一行目录切成记号流：正文 / 点线 / 页标。
 ///
-/// 目录行的实际阅读顺序是 `[上一条的尾巴] …… [页码] [下一条的开头]`，
-/// 而且一行里出现两组点线是常态（上一条的页码 + 本条完整的「标题……页码」）。
-/// 所以必须按记号流处理，不能只找最长的那一段。
-fn dot_tokens(t: &str) -> Vec<DotTok> {
+/// 目录行的实际阅读顺序可能是 `[上一条的尾巴] …… [页码] [下一条的开头]`，
+/// 一行里出现两组点线是常态，所以按记号流处理，不能只找最长的那一段。
+/// 点线判定（允许夹空格）：
+///   · 句点（`.` `·` `．`）达到 4 个，或 `…` 连写 4 个以上；
+///   · 或至少 2 个句点、后面紧跟页标；
+///   · 或前面是空白、句点一直延伸到行尾 —— 长标题把页标挤到了下一行，本行只剩半截点线。
+/// 后两条只认句点：中文正文的省略号 `……` 是两个 `…`，按点线处理会连同省略号一起被吃掉。
+/// 点线后的页标取最长的 `[A-Za-z0-9-]` 串：`…….13图 2-2…` 里只取 `13`，后面是下一条的开头。
+fn toc_tokens(t: &str) -> Vec<TocTok> {
     let cs: Vec<char> = t.chars().collect();
-    let is_dot = |c: char| matches!(c, '.' | '·' | '…' | '．');
-    let mut out: Vec<DotTok> = Vec::new();
+    let mut out: Vec<TocTok> = Vec::new();
     let mut txt = String::new();
     let mut i = 0usize;
     while i < cs.len() {
-        if is_dot(cs[i]) {
-            let s = i;
-            while i < cs.len() && is_dot(cs[i]) {
-                i += 1;
-            }
-            // 至少 4 个点号才算引导符，避免把省略号、句末句点当目录
-            if i - s >= 4 {
-                out.push(DotTok::Text(std::mem::take(&mut txt)));
-                let mut k = i;
-                while k < cs.len() && cs[k] == ' ' {
-                    k += 1;
-                }
-                let ds = k;
-                while k < cs.len() && cs[k].is_ascii_digit() {
-                    k += 1;
-                }
-                let page = if k > ds {
-                    Some(cs[ds..k].iter().collect())
-                } else {
-                    None
-                };
-                out.push(DotTok::Dots(page));
-                i = k;
-            } else {
-                for c in &cs[s..i] {
-                    txt.push(*c);
-                }
-            }
-        } else {
+        if !is_dot_char(cs[i]) {
             txt.push(cs[i]);
             i += 1;
+            continue;
+        }
+        let s = i;
+        let mut dots = 0usize;
+        let mut ell = 0usize;
+        let mut j = i;
+        while j < cs.len() && (is_dot_char(cs[j]) || cs[j] == ' ') {
+            if is_dot_char(cs[j]) {
+                if cs[j] == '…' {
+                    ell += 1;
+                } else {
+                    dots += 1;
+                }
+            }
+            j += 1;
+        }
+        let mut k = j;
+        while k < cs.len() && (cs[k].is_ascii_alphanumeric() || cs[k] == '-') {
+            k += 1;
+        }
+        let label: String = cs[j..k].iter().collect();
+        let has_label = is_page_label(&label);
+        let to_end = j >= cs.len();
+        let spaced = s > 0 && cs[s - 1].is_whitespace();
+        // 句点那条线（`dots`）才有弱判据；`…` 只有连写 4 个以上才认，
+        // 否则中文正文的省略号 `……` 会被当成引导符，重排后连同省略号一起消失
+        let is_leader = dots >= 4
+            || ell >= 4
+            || (dots >= 2 && has_label)
+            || (to_end && spaced && dots >= 1);
+        if is_leader {
+            flush_toc_text(&mut out, &mut txt);
+            out.push(TocTok::Leader);
+            if has_label {
+                out.push(TocTok::Page(label));
+                i = k;
+            } else {
+                i = j;
+            }
+        } else {
+            // 不是点线：版本号、编号里的点，句末句点，原样当正文
+            for c in &cs[s..j] {
+                txt.push(*c);
+            }
+            i = j;
         }
     }
-    out.push(DotTok::Text(txt));
+    flush_toc_text(&mut out, &mut txt);
     out
 }
 
-fn has_dots(t: &str) -> bool {
-    dot_tokens(t).iter().any(|x| matches!(x, DotTok::Dots(_)))
+/// 一行目录的记号流，另外补上两种没有点线的形态：
+///   · 整行只有页标（长标题把页标挤到了下一行，`19-35` 单独一行）；
+///   · 编号条目的标题排满整行，页标直接跟在后面（`25.2.1.2 … enabled  25-3`）。
+fn toc_line_tokens(t: &str) -> Vec<TocTok> {
+    let s = t.trim();
+    if is_page_label(s) {
+        return vec![TocTok::Page(s.to_string())];
+    }
+    let toks = toc_tokens(s);
+    if toks.len() == 1 && starts_with_section_number(s) {
+        let split = match toks.first() {
+            Some(TocTok::Text(x)) => x
+                .rsplit_once(char::is_whitespace)
+                .filter(|(head, last)| is_strong_label(last) && !head.trim().is_empty())
+                .map(|(head, last)| (head.trim().to_string(), last.to_string())),
+            _ => None,
+        };
+        if let Some((head, last)) = split {
+            return vec![TocTok::Text(head), TocTok::Page(last)];
+        }
+    }
+    toks
+}
+
+/// 目录区内部可以接续的行：带点线、只有页标、或者「标题 + 页标」的编号条目
+fn toc_line_ok(t: &str) -> bool {
+    let toks = toc_line_tokens(t);
+    toks.iter().any(|x| matches!(x, TocTok::Leader))
+        || matches!(
+            toks.as_slice(),
+            [TocTok::Page(_)] | [TocTok::Text(_), TocTok::Page(_)]
+        )
 }
 
 fn set_line_text(l: &mut Line, t: &str) {
@@ -1759,75 +2291,101 @@ fn set_line_text(l: &mut Line, t: &str) {
     l.chars.clear();
 }
 
-/// 把连续的点线目录行重排成「标题 …… 页码」。
+/// 把目录区重排成「标题 ........ 页标」，每条一行，交给 `toc_entry` 输出成 `- 标题 · 页标`。
 ///
-/// 不重排的话，一条完整条目会被拆成两半、还和相邻条目粘在一起：
-/// `图 2-1AUTOSAR架构 4.3.0.......13图 2-2BSW卫星副本与代理`。
-/// 重排后每行都是标准目录行，交给 `toc_entry` 输出成 `- 标题 · 页码`。
+/// 不重排的话：条目被点线拆成两半、还和相邻条目粘在一起
+/// （`图 2-1AUTOSAR架构 4.3.0.......13图 2-2BSW卫星副本与代理`）；
+/// 表格识别还会把「编号 | 标题」切成两列；长标题把页标挤到下一行时，页标变成孤零零的一行。
+/// 目录区从带点线（≥4 个点）的行开始，向后吸收：带点线的行、只有页标的行、
+/// 以页标收尾的无点线编号条目，以及夹在中间、编号开头的折行长标题。
+/// 任何文字都不丢：缺页标的条目、孤立的页标都原样保留成单独一行。
 fn rebuild_toc(all: &mut Vec<Line>) {
     let mut i = 0usize;
     while i < all.len() {
-        if !has_dots(&all[i].text) {
+        if !has_leader(&all[i].text) {
             i += 1;
             continue;
         }
-        let mut j = i;
-        while j < all.len() && has_dots(&all[j].text) {
-            j += 1;
+        let mut j = i + 1;
+        while j < all.len() {
+            let t = all[j].text.as_str();
+            if has_leader(t) || toc_line_ok(t) {
+                j += 1;
+                continue;
+            }
+            let wrapped = starts_with_section_number(t.trim())
+                && t.chars().count() <= 160
+                && j + 1 < all.len()
+                && has_leader(&all[j + 1].text);
+            if wrapped {
+                j += 1;
+                continue;
+            }
+            break;
         }
-        let tmpl = all[i].clone();
-        let mut entries: Vec<(String, Option<String>)> = Vec::new();
-        let mut acc = String::new();
+
+        // 条目：(标题, 页标, 标题起始行)。起始行决定输出位置所在的页与纵坐标
+        let mut entries: Vec<(String, Option<String>, usize)> = Vec::new();
+        let mut title = String::new();
+        let mut title_line = i;
+        let mut awaiting = false;
         for k in i..j {
-            for tok in dot_tokens(&all[k].text) {
+            for tok in toc_line_tokens(&all[k].text) {
                 match tok {
-                    DotTok::Text(s) => {
-                        let s = s.trim();
-                        if s.is_empty() {
-                            continue;
+                    TocTok::Text(s) => {
+                        // 点线之后没等到页标又出现了正文：上一条缺页标，单独成条
+                        if awaiting && !title.is_empty() {
+                            entries.push((std::mem::take(&mut title), None, title_line));
                         }
-                        if !acc.is_empty() {
-                            let a = acc.chars().last().unwrap_or(' ');
+                        awaiting = false;
+                        if title.is_empty() {
+                            title_line = k;
+                        } else {
+                            let a = title.chars().last().unwrap_or(' ');
                             let b = s.chars().next().unwrap_or(' ');
-                            if !is_wide(a) && !is_wide(b) && !a.is_whitespace() && !b.is_whitespace()
-                            {
-                                acc.push(' ');
+                            if !is_wide(a) && !is_wide(b) {
+                                title.push(' ');
                             }
                         }
-                        acc.push_str(s);
+                        title.push_str(&s);
                     }
-                    DotTok::Dots(page) => {
-                        let title = acc.trim().to_string();
-                        acc.clear();
-                        if !title.is_empty() && title.chars().count() <= 90 {
-                            entries.push((title, page));
+                    TocTok::Leader => awaiting = true,
+                    TocTok::Page(p) => {
+                        let attach = title.is_empty()
+                            && entries.last().map(|e| e.1.is_none()).unwrap_or(false);
+                        if !title.is_empty() {
+                            entries.push((std::mem::take(&mut title), Some(p), title_line));
+                        } else if attach {
+                            if let Some(last) = entries.last_mut() {
+                                last.1 = Some(p);
+                            }
+                        } else {
+                            // 孤立的页标：不知道属于哪一条，原样保留
+                            entries.push((p, None, k));
                         }
+                        awaiting = false;
                     }
                 }
             }
         }
+        if !title.is_empty() {
+            entries.push((title, None, title_line));
+        }
 
-        let mut fresh: Vec<Line> = Vec::new();
-        for (title, page) in entries {
-            let mut l = tmpl.clone();
+        let mut fresh: Vec<Line> = Vec::with_capacity(entries.len());
+        for (t, page, src) in entries {
+            let mut l = all[src].clone();
+            let t = squeeze_cjk_spaces(&t);
             match page {
-                Some(p) => set_line_text(&mut l, &format!("{} ........ {}", title, p)),
-                None => set_line_text(&mut l, &title),
+                Some(p) => set_line_text(&mut l, &format!("{} ........ {}", t, p)),
+                None => set_line_text(&mut l, &t),
             }
             fresh.push(l);
         }
-        // 区域末尾残余的是下一条的开头，页码不在这片区域里
-        let tail = acc.trim().to_string();
-        if !tail.is_empty() && tail.chars().count() <= 90 {
-            let mut l = tmpl.clone();
-            set_line_text(&mut l, &tail);
-            fresh.push(l);
-        }
-
         let n = fresh.len();
-        let empty = n == 0;
         all.splice(i..j, fresh);
-        i += if empty { 1 } else { n };
+        // n == 0：这一片只有孤立的点线，已被删除；原地继续检查挪到 i 的新行
+        i += n;
     }
 }
 
@@ -1837,6 +2395,10 @@ fn rebuild_toc(all: &mut Vec<Line>) {
 /// · 整行短、且不以句末标点收尾
 fn is_numbered_toc(t: &str) -> bool {
     let s = t.trim();
+    // 已经重排好的「标题 ........ 页标」由 toc_entry 负责，不能再被加一层列表前缀
+    if toc_entry(s).is_some() {
+        return false;
+    }
     let n = s.chars().count();
     if n < 3 || n > 60 {
         return false;
@@ -1899,6 +2461,300 @@ fn mark_numbered_toc(all: &mut [Line]) {
     }
 }
 
+/* ────────── 书签 → 标题层级 ────────── */
+
+/// 标题比对键：只留字母数字（含汉字）并统一小写 —— 抹平空格、™、标点与断词差异
+fn norm_key(s: &str) -> String {
+    s.chars()
+        .filter(|c| c.is_alphanumeric())
+        .flat_map(|c| c.to_lowercase())
+        .collect()
+}
+
+/// 书签索引：目标页 → [(层级, 比对键, 是否已认领)]
+struct OutlineIndex {
+    by_page: HashMap<u32, Vec<(u8, String, bool)>>,
+    total: usize,
+    matched: usize,
+}
+
+impl OutlineIndex {
+    fn new(outline: &[(u8, String, u32)]) -> OutlineIndex {
+        let mut by_page: HashMap<u32, Vec<(u8, String, bool)>> = HashMap::new();
+        let mut total = 0usize;
+        for (level, title, page) in outline {
+            let key = norm_key(title);
+            if *page == 0 || key.chars().count() < 2 {
+                continue;
+            }
+            total += 1;
+            by_page.entry(*page).or_default().push((*level, key, false));
+        }
+        OutlineIndex { by_page, total, matched: 0 }
+    }
+
+    /// 认领一条书签：同一页、比对键一致、尚未被认领过。返回书签层级
+    fn claim(&mut self, page: u32, text: &str) -> Option<u8> {
+        let key = norm_key(text);
+        if key.chars().count() < 2 {
+            return None;
+        }
+        let list = self.by_page.get_mut(&page)?;
+        let entry = list.iter_mut().find(|e| !e.2 && e.1 == key)?;
+        entry.2 = true;
+        let level = entry.0;
+        self.matched += 1;
+        Some(level)
+    }
+
+    /// 书签可信：条目够多，且至少三成能在目标页找到对应的标题行。
+    /// 书签与正文对不上的文档（书签是另起的名字、目标页整体错位）退回按字号判断标题。
+    fn trusted(&self) -> bool {
+        self.total >= 3 && self.matched * 10 >= self.total * 3
+    }
+}
+
+/// 字号够大、但明显不是标题的碎字：图里的单个字母、数字、编码片段（`K`、`3`、`96`、`SA –`）。
+/// 书签可信时只给书签之外的标题用更严格的门槛 —— 真正的章节标题已经由书签认领。
+fn heading_text_ok(t: &str, strict: bool) -> bool {
+    let letters = t.chars().filter(|c| c.is_alphabetic()).count();
+    // 汉字标题可以只有一个字（「序」「跋」）；拉丁字母则要求成词
+    let need = if t.chars().any(is_cjk) {
+        1
+    } else if strict {
+        3
+    } else {
+        2
+    };
+    letters >= need
+}
+
+/* ────────── 矢量图：以图题为锚点圈出图的范围 ────────── */
+
+/// 一幅矢量图：图内文字从正文里摘出来，紧跟图题输出成折叠块
+struct Figure {
+    page: u32,
+    texts: Vec<String>,
+}
+
+/// 图题号之后的部分；不是图题返回 None。
+/// 认 `Figure 3` / `FIGURE 3` / `Fig. 3-1` / `Abbildung 2` / `图 3`；编号后面必须是空白、标点或行尾，
+/// `Figure3D` 这种词不算。
+fn caption_rest(t: &str) -> Option<&str> {
+    let t = t.trim();
+    if t.chars().count() > 160 {
+        return None;
+    }
+    let rest = ["Figure", "FIGURE", "Fig.", "Abbildung", "图"]
+        .iter()
+        .find_map(|p| t.strip_prefix(*p))?
+        .trim_start();
+    if !rest.starts_with(|c: char| c.is_ascii_digit()) {
+        return None;
+    }
+    let n = rest
+        .find(|c: char| !(c.is_ascii_digit() || matches!(c, '-' | '.' | '–')))
+        .unwrap_or(rest.len());
+    let after = &rest[n..];
+    if !after.is_empty()
+        && !after.starts_with(|c: char| c.is_whitespace() || matches!(c, ':' | '：' | ','))
+    {
+        return None;
+    }
+    Some(after.trim())
+}
+
+fn is_caption(l: &Line) -> bool {
+    let head = l.text.trim_start();
+    if !(head.starts_with("Fig")
+        || head.starts_with("FIG")
+        || head.starts_with("Abb")
+        || head.starts_with('图'))
+    {
+        return false;
+    }
+    caption_rest(&line_text(l)).is_some()
+}
+
+/// 图题在图上方的版式才向下找图。正文里的「Figure 1 shows …」也以图号开头，
+/// 但它是句子（以句号收尾）—— 只有不像句子的短行才允许向下找，免得把下方的图挂到这句话上。
+fn caption_strong(l: &Line) -> bool {
+    let t = line_text(l);
+    let t = t.trim_end();
+    t.chars().count() <= 100 && !t.ends_with(|c: char| matches!(c, '.' | '。' | ':' | '：'))
+}
+
+fn rect_union(a: Rect, b: Rect) -> Rect {
+    Rect {
+        x0: a.x0.min(b.x0),
+        y0: a.y0.min(b.y0),
+        x1: a.x1.max(b.x1),
+        y1: a.y1.max(b.y1),
+    }
+}
+
+/// 从图题出发，把紧挨着的图形层标记（描边 / 填充）逐个并进来，直到出现空档。
+/// up = true 向上找（图题在图下方，FrameMaker 默认版式），否则向下找。
+/// 中间夹着一段正文（≥ 25 个字的行）就停：那是另一块内容，不是同一幅图。
+fn grow_figure(marks: &[Rect], lines: &[&Line], cap: &Line, up: bool) -> Option<Rect> {
+    const FIRST_GAP: f64 = 20.0;
+    const GAP: f64 = 18.0;
+    let page_h = cap.page_h.max(1.0);
+    let page_w = cap.page_w.max(1.0);
+    let cap_top = cap.y - cap.size;
+    let cap_bottom = cap.y + cap.size * 0.3;
+    let mut cand: Vec<Rect> = marks
+        .iter()
+        .copied()
+        .filter(|m| {
+            // 小圆点（列表符号）、页眉页脚区的线条与标志不参与
+            let big = (m.x1 - m.x0).max(m.y1 - m.y0) >= 6.0;
+            let edge = m.y1 <= page_h * 0.09 || m.y0 >= page_h * 0.91;
+            let side = if up { m.y1 <= cap_top + 2.0 } else { m.y0 >= cap_bottom - 2.0 };
+            big && !edge && side
+        })
+        .collect();
+    if up {
+        cand.sort_by(|a, b| b.y1.partial_cmp(&a.y1).unwrap_or(std::cmp::Ordering::Equal));
+    } else {
+        cand.sort_by(|a, b| a.y0.partial_cmp(&b.y0).unwrap_or(std::cmp::Ordering::Equal));
+    }
+    let mut edge = if up { cap_top } else { cap_bottom };
+    let mut region: Option<Rect> = None;
+    let mut used: Vec<Rect> = Vec::new();
+    for m in cand {
+        let gap = if region.is_none() { FIRST_GAP } else { GAP };
+        let near = if up { m.y1 >= edge - gap } else { m.y0 <= edge + gap };
+        if !near {
+            break;
+        }
+        // 当前区域与这个标记之间的空档里有没有正文
+        let (lo, hi) = if up { (m.y1, edge) } else { (edge, m.y0) };
+        if hi > lo + 1.0
+            && lines
+                .iter()
+                .any(|l| l.y > lo + 1.0 && l.y < hi - 1.0 && l.text.chars().count() >= 25)
+        {
+            break;
+        }
+        region = Some(match region {
+            None => m,
+            Some(r) => rect_union(r, m),
+        });
+        used.push(m);
+        edge = if up { edge.min(m.y0) } else { edge.max(m.y1) };
+    }
+    let r = region?;
+    // 贯穿整片区域的细横线：图只有外框的上下两条，表格每行一条（实测表 2 有 12 条）。
+    // 达到 3 条就是紧挨着图题的表格，不能当成图把整张表收进折叠块
+    let width = r.x1 - r.x0;
+    let rules = used
+        .iter()
+        .filter(|m| m.y1 - m.y0 <= 1.5 && m.x1 - m.x0 >= width * 0.9)
+        .count();
+    if used.len() >= 2 && rules < 3 && r.y1 - r.y0 >= 30.0 && width >= page_w * 0.2 {
+        Some(r)
+    } else {
+        None
+    }
+}
+
+/// 找出矢量图并给图题打标。返回 (每行归属的图编号，0 = 正文；图列表，编号 = 下标 + 1)。
+/// 框图、示意图只存在于图形层，pdf-extract 只拿得到图里零散的文字（模块名、连线标注、
+/// 旋转的竖排小字），混进正文就是一堆 `Prim / a / ry / AD / C`，还会被大字号误判成标题。
+fn detect_figures(all: &mut [Line], meta: &PageMeta) -> (Vec<u32>, Vec<Figure>) {
+    let mut owner: Vec<u32> = vec![0; all.len()];
+    let mut figs: Vec<Figure> = Vec::new();
+    let mut i = 0usize;
+    while i < all.len() {
+        let page = all[i].page;
+        let mut j = i;
+        while j < all.len() && all[j].page == page {
+            j += 1;
+        }
+        if let Some(marks) = meta.graphics.get(&page) {
+            for c in i..j {
+                if owner[c] != 0 || !is_caption(&all[c]) {
+                    continue;
+                }
+                let region = {
+                    let lines: Vec<&Line> = all[i..j].iter().collect();
+                    let cap = &all[c];
+                    match grow_figure(marks, &lines, cap, true) {
+                        Some(r) => Some(r),
+                        None if caption_strong(cap) => grow_figure(marks, &lines, cap, false),
+                        None => None,
+                    }
+                };
+                let Some(r) = region else { continue };
+                let id = figs.len() as u32 + 1;
+                let mut texts: Vec<String> = Vec::new();
+                for k in i..j {
+                    if k == c || owner[k] != 0 {
+                        continue;
+                    }
+                    let l = &all[k];
+                    let inside = l.y >= r.y0 - 2.0
+                        && l.y - l.size * 0.8 <= r.y1 + 2.0
+                        && l.x0 >= r.x0 - 2.0
+                        && l.x1 <= r.x1 + 2.0;
+                    if inside && l.text.chars().count() <= 120 {
+                        owner[k] = id;
+                        texts.push(line_text(l));
+                    }
+                }
+                all[c].fig_caption = id;
+                figs.push(Figure { page, texts });
+            }
+        }
+        i = j;
+    }
+    (owner, figs)
+}
+
+/// 图内文字的折叠块。正文按原样逐行放进代码块：这些碎片没有可靠的阅读顺序，
+/// 只保证不丢、可搜索；看图请回到原 PDF 的对应页。
+fn render_figure(f: &Figure) -> String {
+    if f.texts.is_empty() {
+        return String::new();
+    }
+    let body = f.texts.join("\n");
+    let mut run = 0usize;
+    let mut longest = 0usize;
+    for c in body.chars() {
+        if c == '`' {
+            run += 1;
+            longest = longest.max(run);
+        } else {
+            run = 0;
+        }
+    }
+    let fence = "`".repeat((longest + 1).max(3));
+    format!(
+        "<details>\n<summary>图内文字（仅供检索，版式与图形请看原 PDF 第 {} 页）</summary>\n\n{}text\n{}\n{}\n\n</details>\n\n",
+        f.page, fence, body, fence
+    )
+}
+
+/// 输出一幅图的折叠块（每幅只输出一次）
+fn emit_figure(out: &mut String, id: u32, figures: &[Figure], done: &mut HashSet<u32>) {
+    if id == 0 || !done.insert(id) {
+        return;
+    }
+    if let Some(f) = figures.get(id as usize - 1) {
+        out.push_str(&render_figure(f));
+    }
+}
+
+/// 图题没能输出（被并进别的块等）时的兜底：离开这一页前把这页的图补上，文字绝不丢
+fn flush_page_figures(out: &mut String, page: u32, figures: &[Figure], done: &mut HashSet<u32>) {
+    for (k, f) in figures.iter().enumerate() {
+        if f.page == page {
+            emit_figure(out, k as u32 + 1, figures, done);
+        }
+    }
+}
+
 fn lines_to_md(
     all: &mut Vec<Line>,
     images: &HashMap<u32, Vec<(f64, String)>>,
@@ -1914,33 +2770,69 @@ fn lines_to_md(
     fix_reversed_pages(all);
 
     /* 1) 页眉页脚：只看页面上下边缘区域，且必须在多页重复出现。
-     *    旧实现全篇比对「出现 ≥3 次」，正文里重复的短行（每章都有的「本章小结」）会被误删。 */
-    let mut edge_pages: HashMap<String, HashSet<u32>> = HashMap::new();
+     *    旧实现全篇比对「出现 ≥3 次」，正文里重复的短行（每章都有的「本章小结」）会被误删。
+     *    比对前先把数字串归一化成 `#`：页脚里的页码每页都不同（`User’s Manual 1-3 V1.5.0`），
+     *    不归一化就永远凑不齐「多页重复」。章节页眉只出现在本章的页上，达不到「半数以上的页」，
+     *    所以另加一条：相邻几页里反复出现的边缘行同样是页眉页脚。 */
+    let mut edge_pages: HashMap<String, BTreeMap<u32, f64>> = HashMap::new();
     for l in all.iter() {
         if !in_margin(l) {
             continue;
         }
-        let k = l.text.trim().to_string();
-        if k.is_empty() || k.chars().count() > 80 {
+        let t = l.text.trim();
+        if t.is_empty() || t.chars().count() > 80 {
             continue;
         }
-        edge_pages.entry(k).or_default().insert(l.page);
+        edge_pages
+            .entry(edge_key(t))
+            .or_default()
+            .entry(l.page)
+            .or_insert(l.y);
     }
     all.retain(|l| {
         if !in_margin(l) {
             return true;
         }
-        let k = l.text.trim().to_string();
-        if let Some(set) = edge_pages.get(&k) {
-            // 出现 ≥2 个不同页、且覆盖到半数以上的页 → 页眉/页脚
-            if set.len() >= 2 && (set.len() as f64) >= pages as f64 * 0.5 {
-                return false;
+        let t = l.text.trim();
+        if t.chars().count() <= 80 {
+            let key = edge_key(t);
+            if let Some(seen) = edge_pages.get(&key) {
+                if is_running_edge(&key, seen, l.page, l.y, pages) {
+                    return false;
+                }
             }
         }
-        !looks_like_page_number(&k)
+        !looks_like_page_number(t)
     });
     if all.is_empty() {
         return String::new();
+    }
+
+    /* 1.2) 矢量图：图内的碎片文字摘出正文，之后紧跟图题输出成折叠块。
+     *      必须在双栏重排、表格识别、标题判定之前做 —— 图里的文字会干扰这三步。 */
+    let (owner, figures) = detect_figures(all, meta);
+    if owner.iter().any(|o| *o != 0) {
+        let mut k = 0usize;
+        all.retain(|_| {
+            let keep = owner[k] == 0;
+            k += 1;
+            keep
+        });
+    }
+    let with_text = figures.iter().filter(|f| !f.texts.is_empty()).count();
+    if with_text > 0 {
+        crate::convert::warn(format!(
+            "{} 处图形区域的文字已收进图题下方的折叠块（仅供检索），版式与图形请对照原 PDF",
+            with_text
+        ));
+    }
+    if all.is_empty() {
+        let mut out = String::new();
+        let mut done: HashSet<u32> = HashSet::new();
+        for k in 0..figures.len() {
+            emit_figure(&mut out, k as u32 + 1, &figures, &mut done);
+        }
+        return out;
     }
 
     /* 1.5) 双栏重排：必须在页眉页脚清掉之后做，否则居中的页码会破坏左右聚类 */
@@ -1955,6 +2847,22 @@ fn lines_to_md(
 
     /* 1.8) 不带点线的编号目录行（`1 简介` / `2.1 术语`）→ 列表项 */
     mark_numbered_toc(all);
+
+    /* 1.9) 书签：与目标页上某一行的文字一致，这一行就是标题，层级取书签层级。
+     *      字号只能区分三四档，而且同字号的加粗小标题（`1.1 About this Document`）会漏掉；
+     *      书签是作者给出的章节结构，比字号可靠得多。页眉页脚区的行不参与，免得章节名页眉抢先认领。 */
+    let mut outline = OutlineIndex::new(&meta.outline);
+    if outline.total > 0 {
+        for l in all.iter_mut() {
+            if in_margin(l) || l.quote != 0 || l.fig_caption != 0 {
+                continue;
+            }
+            let t = line_text(l);
+            if let Some(level) = outline.claim(l.page, &t) {
+                l.outline_level = level;
+            }
+        }
+    }
 
     /* 2) 正文基准字号：按**字符数**加权投票。
      *    旧实现按行数投票，表格密集的文档里 9pt 表格行会把 body 拉到 9pt，
@@ -2105,14 +3013,29 @@ fn lines_to_md(
                 header.as_ref().map(|h| h.iter().map(|(_, t)| t.clone()).collect());
             let mut out_rows: Vec<Vec<String>> = Vec::new();
 
-            // ②' 没有表头时，表可能从上一段延续过来：用同一张网格往前补
+            // ②' 没有表头时，表可能从上一段延续过来：用同一张网格往前补。
+            //     自下而上扫描：
+            //       · 首列有字、且各段都落在网格上 → 新的一行，认领它下方暂存的续行；
+            //       · 只有非首列有字 → 续行，先暂存，等上方的行首来认领；
+            //       · 只有首列有字、且与暂存续行处在同一纵向范围 → 列优先排版的首列多行标签
+            //         （PDF 先画完左列的 `Unimplemented, / Reserved`，再从同一行顶部画右列说明）。
+            //     必须校验 fits_grid：否则上方的正文、表题、页眉都会被网格硬切成「单元格」。
+            //     回扫结束时仍没被认领的续行不属于这张表：begin 退回最后一次确认的位置，
+            //     把它们留给正文输出 —— 不能被表格范围吞掉而凭空消失。
             let mut begin = start;
             if header.is_none() {
                 let mut pend: Vec<(usize, String)> = Vec::new();
+                let mut pend_top = f64::MAX;
+                let mut pend_bottom = f64::MIN;
+                let mut label: Vec<String> = Vec::new();
                 let mut back: Vec<Vec<String>> = Vec::new();
+                let mut committed = begin;
                 while begin > last_table_end {
                     let l = &all[begin - 1];
-                    if l.page != all[i].page || (l.size - all[i].size).abs() > 0.8 {
+                    if l.page != all[i].page
+                        || (l.size - all[i].size).abs() > 0.8
+                        || l.fig_caption != 0
+                    {
                         break;
                     }
                     let cells = cut_by_grid(l, &grid);
@@ -2123,26 +3046,53 @@ fn lines_to_md(
                     }
                     if filled[0] == 0 {
                         let fx = l.chars.first().map(|c| c.0).unwrap_or(-1.0);
-                        if (fx - grid[0]).abs() > 5.0 || filled.len() < 2 {
+                        if (fx - grid[0]).abs() > 5.0 {
                             break;
                         }
-                        let mut row = cells;
-                        for (k, t) in pend.drain(..) {
-                            if let Some(slot) = row.get_mut(k) {
-                                if !slot.is_empty() {
-                                    slot.push(' ');
-                                }
-                                slot.push_str(&t);
+                        if filled.len() >= 2 {
+                            if !fits_grid(l, &grid) {
+                                break;
                             }
+                            // 下方还有一行列优先的待定行：它的标签与续行已经齐了，先收尾
+                            if !label.is_empty() {
+                                back.push(label_row(&mut label, &mut pend, grid.len()));
+                            }
+                            let mut row = row_of(&cells, grid.len());
+                            append_pending(&mut row, &mut pend);
+                            pend_top = f64::MAX;
+                            pend_bottom = f64::MIN;
+                            back.push(row);
+                            begin -= 1;
+                            committed = begin;
+                            continue;
                         }
-                        back.push(row);
-                    } else {
-                        for k in filled {
-                            pend.push((k, cells[k].clone()));
+                        let tol = l.size * 0.6;
+                        if !pend.is_empty() && l.y >= pend_top - tol && l.y <= pend_bottom + tol {
+                            label.push(cells[0].clone());
+                            begin -= 1;
+                            continue;
                         }
+                        break;
                     }
+                    // 只有非首列有字：续行。若上方又出现续行，下方的「标签 + 续行」已构成完整一行
+                    if !label.is_empty() {
+                        back.push(label_row(&mut label, &mut pend, grid.len()));
+                        pend_top = f64::MAX;
+                        pend_bottom = f64::MIN;
+                        committed = begin;
+                    }
+                    for k in filled {
+                        pend.push((k, cells[k].clone()));
+                    }
+                    pend_top = pend_top.min(l.y);
+                    pend_bottom = pend_bottom.max(l.y);
                     begin -= 1;
                 }
+                if !label.is_empty() {
+                    back.push(label_row(&mut label, &mut pend, grid.len()));
+                    committed = begin;
+                }
+                begin = committed;
                 back.reverse();
                 for (n, r) in back.into_iter().enumerate() {
                     out_rows.insert(n, r);
@@ -2153,8 +3103,8 @@ fn lines_to_md(
             let mut cur_page = all[start].page;
             while end < all.len() && out_rows.len() < 400 {
                 let l = &all[end];
-                // 允许跨一页续接（长表格）
-                if l.page > cur_page + 1 || (l.size - all[i].size).abs() > 0.8 {
+                // 允许跨一页续接（长表格）；图题不属于表格
+                if l.page > cur_page + 1 || (l.size - all[i].size).abs() > 0.8 || l.fig_caption != 0 {
                     break;
                 }
                 if end == start && header.is_some() {
@@ -2188,18 +3138,34 @@ fn lines_to_md(
                 }
                 if filled[0] == 0 {
                     let fx = l.chars.first().map(|c| c.0).unwrap_or(-1.0);
-                    if (fx - head_x).abs() > 5.0 || filled.len() < 2 || !fits_grid(l, &grid) {
+                    if (fx - head_x).abs() > 5.0 {
                         break;
                     }
-                    out_rows.push(cells);
+                    if filled.len() < 2 || !fits_grid(l, &grid) {
+                        // 列优先排版的一行：首列多行标签在前，右列说明随后从同一行顶部开始
+                        let n = if filled.len() == 1 {
+                            column_first_labels(all, end, &grid, head_x, all[i].size)
+                        } else {
+                            0
+                        };
+                        if n == 0 {
+                            break;
+                        }
+                        let mut row = vec![String::new(); grid.len()];
+                        for li in end..end + n {
+                            let c = cut_by_grid(&all[li], &grid);
+                            join_cell(&mut row[0], &c[0]);
+                        }
+                        out_rows.push(row);
+                        end += n;
+                        continue;
+                    }
+                    out_rows.push(row_of(&cells, grid.len()));
                 } else {
                     let Some(row) = out_rows.last_mut() else { break };
                     for k in filled {
                         if let Some(slot) = row.get_mut(k) {
-                            if !slot.is_empty() {
-                                slot.push(' ');
-                            }
-                            slot.push_str(&cells[k]);
+                            join_cell(slot, &cells[k]);
                         }
                     }
                 }
@@ -2275,6 +3241,8 @@ fn lines_to_md(
                 quote: 0,
                 quote_head: false,
                 quote_code: false,
+                level: 0,
+                fig: 0,
             });
             idx = end + 1;
             continue;
@@ -2332,6 +3300,11 @@ fn lines_to_md(
                 && toc_entry(&prev.text).is_none()
                 && toc_entry(&t).is_none()
                 && bullet_prefix(&t).is_none()
+                // 书签标题、图题各自独立成块
+                && prev.level == 0
+                && l.outline_level == 0
+                && prev.fig == 0
+                && l.fig_caption == 0
                 && l.size <= prev.size * 1.08
                 && l.size * 1.12 >= prev.size;
             if can_merge {
@@ -2375,12 +3348,37 @@ fn lines_to_md(
             quote: l.quote,
             quote_head: l.quote_head,
             quote_code: l.quote_code,
+            level: l.outline_level,
+            fig: l.fig_caption,
         });
+    }
+
+    // 书签标题在 PDF 里折成了两行时，合并之后按整块再比一次
+    if outline.total > 0 {
+        for b in blocks.iter_mut() {
+            if b.pre || b.level != 0 || b.quote != 0 || b.fig != 0 {
+                continue;
+            }
+            if let Some(level) = outline.claim(b.page, &b.text) {
+                b.level = level;
+            }
+        }
+    }
+    // 书签与正文对不上（书签另起了名字、目标页整体错位）时整体放弃，退回按字号判断
+    let use_outline = outline.trusted();
+    if !use_outline {
+        for b in blocks.iter_mut() {
+            b.level = 0;
+        }
     }
 
     // 标题判定放在合并之后：合并会把短行接成长段，先用合并后的长度做过滤更准
     for b in blocks.iter_mut() {
         if b.pre {
+            continue;
+        }
+        if b.level != 0 {
+            b.heading = true;
             continue;
         }
         let n = b.text.chars().count();
@@ -2389,15 +3387,17 @@ fn lines_to_md(
             && !b.multi
             && !b.bullet
             && b.quote == 0
+            && b.fig == 0
             && toc_entry(&b.text).is_none()
-            && bullet_prefix(&b.text).is_none();
+            && bullet_prefix(&b.text).is_none()
+            && heading_text_ok(&b.text, use_outline);
     }
 
     // 标题层级：先按字号倍率定 1~4 档，再把实际用到的档位压成连续层级，
-    // 否则字号分布不巧时会出现「# 之后直接 ###」的跳级。
+    // 否则字号分布不巧时会出现「# 之后直接 ###」的跳级。书签标题的层级直接取书签，不参与。
     let mut head_levels: Vec<u8> = blocks
         .iter()
-        .filter(|b| b.heading)
+        .filter(|b| b.heading && b.level == 0)
         .map(|b| raw_level_of(b.size, body_size))
         .collect();
     head_levels.sort_unstable();
@@ -2412,6 +3412,9 @@ fn lines_to_md(
     let mut in_list = false;
     let mut cur_quote = 0u32;
     let mut fence_open = false;
+    let mut figs_done: HashSet<u32> = HashSet::new();
+    // 最近一个书签标题的层级：书签之外的标题挂在它下面一级
+    let mut last_outline_level: u8 = 0;
 
     for b in blocks {
         // 离开代码框：收围栏。必须**最先**做 —— 后面还有整页图片的刷新，
@@ -2422,6 +3425,9 @@ fn lines_to_md(
         }
         while cur_page < b.page {
             flush_page_images(&mut out, cur_page, images, &mut img_cursor, &mut done);
+            if !fence_open {
+                flush_page_figures(&mut out, cur_page, &figures, &mut figs_done);
+            }
             cur_page += 1;
         }
         if b.page_end > last_end {
@@ -2489,6 +3495,17 @@ fn lines_to_md(
             continue;
         }
 
+        // 矢量图的图题：照常输出图题，紧跟着放图内文字的折叠块
+        if b.fig != 0 {
+            if in_list {
+                out.push('\n');
+                in_list = false;
+            }
+            out.push_str(&format!("{}\n\n", text));
+            emit_figure(&mut out, b.fig, &figures, &mut figs_done);
+            continue;
+        }
+
         // 目录行
         if !b.heading {
             if let Some((title, page)) = toc_entry(&text) {
@@ -2506,12 +3523,19 @@ fn lines_to_md(
                 out.push('\n');
                 in_list = false;
             }
-            let level = head_levels
-                .iter()
-                .position(|r| *r == raw_level_of(b.size, body_size))
-                .map(|i| i + 1)
-                .unwrap_or(1)
-                .min(6);
+            let level = if b.level != 0 {
+                last_outline_level = b.level;
+                (b.level as usize).min(6)
+            } else if use_outline {
+                (last_outline_level as usize + 1).min(6)
+            } else {
+                head_levels
+                    .iter()
+                    .position(|r| *r == raw_level_of(b.size, body_size))
+                    .map(|i| i + 1)
+                    .unwrap_or(1)
+                    .min(6)
+            };
             out.push_str(&format!("{} {}\n\n", "#".repeat(level), text));
             continue;
         }
@@ -2561,6 +3585,7 @@ fn lines_to_md(
     }
     while cur_page <= last_end {
         flush_page_images(&mut out, cur_page, images, &mut img_cursor, &mut done);
+        flush_page_figures(&mut out, cur_page, &figures, &mut figs_done);
         cur_page += 1;
     }
     // 整页只有图、没有文字的页面：追加到末尾，别把内容整页丢掉
@@ -2569,6 +3594,10 @@ fn lines_to_md(
     for p in rest {
         emit_images_before(&mut out, p, f64::MAX, images, &mut img_cursor);
         done.insert(p);
+    }
+    // 图题没能输出、所在页也没轮到刷新的图：最后兜底，图内文字绝不丢
+    for k in 0..figures.len() {
+        emit_figure(&mut out, k as u32 + 1, &figures, &mut figs_done);
     }
     out
 }
@@ -2608,4 +3637,235 @@ fn flush_page_images(
         }
     }
     done.insert(page);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::{BTreeMap, HashMap};
+
+    /// 构造一行：每个片段 (x, 文本) 的字符按 0.5em 等宽排布
+    fn line(page: u32, y: f64, size: f64, segs: &[(f64, &str)]) -> Line {
+        let mut l = Line {
+            page,
+            y,
+            page_w: 595.0,
+            page_h: 842.0,
+            x0: f64::MAX,
+            x1: f64::MIN,
+            size,
+            text: String::new(),
+            segs: Vec::new(),
+            chars: Vec::new(),
+            col: 0,
+            bullet: false,
+            quote: 0,
+            quote_head: false,
+            quote_code: false,
+            fig_caption: 0,
+            outline_level: 0,
+        };
+        for (x, t) in segs {
+            let mut cx = *x;
+            for ch in t.chars() {
+                l.chars.push((cx, ch));
+                cx += size * 0.5;
+            }
+            l.segs.push(Seg { x: *x, end: cx, text: t.to_string() });
+            if !l.text.is_empty() {
+                l.text.push(' ');
+            }
+            l.text.push_str(t);
+            l.x0 = l.x0.min(*x);
+            l.x1 = l.x1.max(cx);
+        }
+        l
+    }
+
+    fn convert_lines(mut lines: Vec<Line>) -> String {
+        let images: HashMap<u32, Vec<(f64, String)>> = HashMap::new();
+        let meta = PageMeta::default();
+        lines_to_md(&mut lines, &images, &meta)
+    }
+
+    #[test]
+    fn keeps_space_carried_by_previous_fragment() {
+        let mut l = line(1, 100.0, 11.0, &[(42.0, "microcontrollers ")]);
+        let end = l.segs[0].end;
+        l.segs.push(Seg { x: end, end: end + 40.0, text: "based on".to_string() });
+        assert_eq!(line_text(&l), "microcontrollers based on");
+    }
+
+    #[test]
+    fn column_first_table_row_keeps_every_line() {
+        // 第 40 页表 2：左列两行标签先画完，右列说明再从同一行顶部开始
+        let out = convert_lines(vec![
+            line(40, 183.9, 11.0, &[(42.6, "Table 2"), (90.0, "Bit Function Terminology")]),
+            line(40, 201.9, 11.0, &[(42.6, "Function of Bits"), (174.1, "Description")]),
+            line(40, 219.4, 11.0, &[(42.6, "Unimplemented,")]),
+            line(40, 233.4, 11.0, &[(42.6, "Reserved")]),
+            line(
+                40,
+                219.4,
+                11.0,
+                &[(174.1, "Register bit fields named 0 indicate unimplemented functions with the following")],
+            ),
+            line(40, 233.4, 11.0, &[(174.1, "behavior:")]),
+            line(40, 250.4, 11.0, &[(174.1, "•Reading these bit fields returns 0.")]),
+            line(40, 301.3, 11.0, &[(174.1, "These bit fields are reserved.")]),
+            line(40, 332.8, 11.0, &[(42.6, "rw"), (174.1, "The bit or bit field can be read and written.")]),
+            line(
+                40,
+                350.3,
+                11.0,
+                &[(42.6, "rwh"), (174.1, "As rw, but bit or bit field can be also set or reset by hardware.")],
+            ),
+            line(40, 367.9, 11.0, &[(42.6, "r"), (174.1, "The bit or bit field can only be read (read-only).")]),
+        ]);
+        assert!(out.contains("Table 2 Bit Function Terminology\n\n| Function of Bits | Description |"), "{}", out);
+        assert!(
+            out.contains(
+                "| Unimplemented, Reserved | Register bit fields named 0 indicate unimplemented functions \
+                 with the following behavior:<br>• Reading these bit fields returns 0. \
+                 These bit fields are reserved. |"
+            ),
+            "{}",
+            out
+        );
+        assert!(out.contains("| rw | The bit or bit field can be read and written. |"), "{}", out);
+    }
+
+    #[test]
+    fn paragraph_above_table_is_not_cut_into_cells() {
+        let out = convert_lines(vec![
+            line(42, 260.0, 11.0, &[(42.5, "From application point of view the register reset value is the initial content.")]),
+            line(42, 280.0, 11.0, &[(42.5, "Symbol"), (131.0, "Description")]),
+            line(42, 298.0, 11.0, &[(42.5, "nBE"), (131.0, "Indicates that no Bus Error is generated.")]),
+            line(42, 316.0, 11.0, &[(42.5, "nE"), (131.0, "Indicates that no Error is generated.")]),
+        ]);
+        assert!(
+            out.starts_with(
+                "From application point of view the register reset value is the initial content.\n\n\
+                 | Symbol | Description |"
+            ),
+            "{}",
+            out
+        );
+        assert!(out.contains("| nBE | Indicates that no Bus Error is generated. |"), "{}", out);
+    }
+
+    #[test]
+    fn toc_handles_spaced_leaders_wrapped_labels_and_missing_leaders() {
+        let mut all = vec![
+            line(25, 700.0, 11.0, &[(42.5, "19.2.8.8.2 Data Read Sequence in Integration Mode  . . . . . . . .  19-17")]),
+            line(25, 714.0, 11.0, &[(42.5, "19.2.8.8.3 Data Mapping for 4 Antennae  . ")]),
+            line(25, 728.0, 11.0, &[(104.9, "19-18")]),
+            line(25, 742.0, 11.0, &[(42.5, "25.2.1.2 Delta-sigma Modulator enabled  25-3")]),
+            line(25, 756.0, 11.0, &[(42.5, "19.2.8.9 3rd stage FFT . . . . . . . 19-20")]),
+        ];
+        rebuild_toc(&mut all);
+        let got: Vec<Option<(String, String)>> = all.iter().map(|l| toc_entry(&l.text)).collect();
+        let want = |t: &str, p: &str| Some((t.to_string(), p.to_string()));
+        assert_eq!(
+            got,
+            vec![
+                want("19.2.8.8.2 Data Read Sequence in Integration Mode", "19-17"),
+                want("19.2.8.8.3 Data Mapping for 4 Antennae", "19-18"),
+                want("25.2.1.2 Delta-sigma Modulator enabled", "25-3"),
+                want("19.2.8.9 3rd stage FFT", "19-20"),
+            ]
+        );
+    }
+
+    #[test]
+    fn toc_keeps_entries_that_share_one_line() {
+        let mut all = vec![line(
+            3,
+            100.0,
+            11.0,
+            &[(42.0, "图 2-1AUTOSAR架构 4.3.0.......13图 2-2BSW卫星副本与代理.......14")],
+        )];
+        rebuild_toc(&mut all);
+        let got: Vec<(String, String)> = all.iter().filter_map(|l| toc_entry(&l.text)).collect();
+        assert_eq!(
+            got,
+            vec![
+                ("图 2-1AUTOSAR架构 4.3.0".to_string(), "13".to_string()),
+                ("图 2-2BSW卫星副本与代理".to_string(), "14".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn page_labels_and_leaders() {
+        assert!(is_page_label("1-52") && is_page_label("TOC-1") && is_page_label("Preface-1"));
+        assert!(!is_page_label("2nd") && !is_page_label("16bit") && !is_page_label("V1.5.0"));
+        assert!(has_leader("About this document. . . . . Preface-1"));
+        assert!(!has_leader("Version 1.1.1 e.g. text"));
+    }
+
+    #[test]
+    fn running_edges_need_same_position_on_neighbour_pages() {
+        assert_eq!(edge_key("User’s Manual 1-3 V1.5.0 "), "User’s Manual #-# V#.#.#");
+        let mut footer: BTreeMap<u32, f64> = BTreeMap::new();
+        for p in 38..=43 {
+            footer.insert(p, 825.4);
+        }
+        assert!(is_running_edge("Introduction", &footer, 40, 825.4, 1942));
+        // 同样文字的脚注，高度随正文浮动：不是页脚
+        let mut note: BTreeMap<u32, f64> = BTreeMap::new();
+        note.insert(39, 771.0);
+        note.insert(40, 783.0);
+        note.insert(41, 790.0);
+        assert!(!is_running_edge("#) Not available", &note, 40, 783.0, 1942));
+    }
+
+    #[test]
+    fn decodes_pdf_text_strings() {
+        assert_eq!(decode_pdf_text(&[0xFE, 0xFF, 0x00, 0x41, 0x21, 0x22]), "A™");
+        assert_eq!(decode_pdf_text(b"AURIX\x92 TC3xx"), "AURIX™ TC3xx");
+    }
+
+    #[test]
+    fn recognises_figure_captions_only() {
+        assert_eq!(caption_rest("Figure 85 System PLL Block Diagram"), Some("System PLL Block Diagram"));
+        assert_eq!(caption_rest("Figure 1"), Some(""));
+        assert_eq!(caption_rest("Figure3D model"), None);
+        assert_eq!(caption_rest("Table 6 Reset Values"), None);
+    }
+
+    #[test]
+    fn headings_need_real_words() {
+        assert!(!heading_text_ok("K", false));
+        assert!(!heading_text_ok("96", false));
+        assert!(!heading_text_ok("SA –", true));
+        assert!(heading_text_ok("序", true));
+        assert!(heading_text_ok("Overview", true));
+    }
+
+    /// 中文正文的省略号是两个 `…`。按「每个 `…` 算 3 点」会凑满 4 点阈值，
+    /// 整行被当成目录行重排，省略号在重排中消失（实测书稿丢了几十处）。
+    #[test]
+    fn cjk_ellipsis_is_not_a_toc_leader() {
+        assert!(!has_leader("当美好的事情发生时能够庆祝……我便能掌握我的力量。"));
+        assert!(!has_leader("消费主义、碎片化的信息、竞争比较……"));
+        assert!(!has_leader("他向我提出了离婚……"));
+        // 真正的引导符仍然认
+        assert!(has_leader("About this document . . . . Preface-1"));
+        assert!(has_leader("1 Introduction ........ 1-1"));
+
+        let mut all = vec![line(
+            1,
+            100.0,
+            11.0,
+            &[(42.0, "他向我提出了离婚……长话短说，今天我们得以一起来到这里。")],
+        )];
+        rebuild_toc(&mut all);
+        assert_eq!(all.len(), 1);
+        assert!(
+            all[0].text.contains("离婚……长话短说"),
+            "省略号被吃掉了：{}",
+            all[0].text
+        );
+    }
 }

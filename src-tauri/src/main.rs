@@ -693,6 +693,13 @@ fn quit_app(app: tauri::AppHandle, code: Option<i32>) {
 
 // ---------- 命令：文档 → Markdown ----------
 
+/// 转换结果：输出路径 + 非致命提示（为空表示没有需要提醒的问题）
+#[derive(Serialize, Clone)]
+struct ConvertResult {
+    path: String,
+    warnings: Vec<String>,
+}
+
 #[tauri::command]
 async fn convert_to_md(
     input: String,
@@ -700,16 +707,19 @@ async fn convert_to_md(
     images: bool,
     front_matter: bool,
     overwrite: bool,
-) -> Result<String, String> {
+) -> Result<ConvertResult, String> {
     on_worker(move || {
         let opts = convert::Options { images, front_matter };
-        let (path, _) = convert::convert_and_write(
+        let (path, conv) = convert::convert_and_write(
             Path::new(&input),
             Path::new(&output),
             &opts,
             overwrite,
         )?;
-        Ok(path.to_string_lossy().into_owned())
+        Ok(ConvertResult {
+            path: path.to_string_lossy().into_owned(),
+            warnings: conv.warnings,
+        })
     })
     .await
 }

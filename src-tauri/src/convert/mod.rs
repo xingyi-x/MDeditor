@@ -425,6 +425,79 @@ fn now_id() -> String {
 
 /* ────────── 对外主入口 ────────── */
 
+/* 转换报告：非致命提示与元信息。
+ * 一次转换只在一个线程里跑完（CLI 主线程 / GUI 的后台线程），用线程局部变量收集，
+ * 各格式的转换函数不必改签名，想报告问题时直接调用 warn / note_meta。 */
+#[derive(Default)]
+struct Report {
+    warnings: Vec<String>,
+    meta: Vec<(String, String)>,
+}
+
+thread_local! {
+    static REPORT: std::cell::RefCell<Report> = std::cell::RefCell::new(Report::default());
+}
+
+/// 记录一条非致命问题：转换照常完成，但结果可能不完整或需要核对
+pub fn warn(msg: impl Into<String>) {
+    let msg = msg.into();
+    REPORT.with(|r| r.borrow_mut().warnings.push(msg));
+}
+
+/// 记录一条元信息（写进 front matter，如 PDF 内部标题、页数）
+pub fn note_meta(key: &str, value: impl Into<String>) {
+    let value = value.into();
+    REPORT.with(|r| r.borrow_mut().meta.push((key.to_string(), value)));
+}
+
+fn reset_report() {
+    REPORT.with(|r| *r.borrow_mut() = Report::default());
+}
+
+fn take_report() -> Report {
+    REPORT.with(|r| std::mem::take(&mut *r.borrow_mut()))
+}
+
+/// 相同的提示合并成一条并注明次数，保持首次出现的顺序
+pub fn summarize(warnings: Vec<String>) -> Vec<String> {
+    let mut order: Vec<String> = Vec::new();
+    let mut count: HashMap<String, usize> = HashMap::new();
+    for w in warnings {
+        let n = count.entry(w.clone()).or_insert(0);
+        if *n == 0 {
+            order.push(w);
+        }
+        *n += 1;
+    }
+    order
+        .into_iter()
+        .map(|w| match count.get(&w).copied().unwrap_or(1) {
+            1 => w,
+            n => format!("{}（{} 次）", w, n),
+        })
+        .collect()
+}
+
+/// 转换结果：Markdown 正文 + 非致命提示 + 元信息
+pub struct Converted {
+    pub md: String,
+    /// 已合并去重；为空表示没有需要提醒的问题
+    pub warnings: Vec<String>,
+    pub meta: Vec<(String, String)>,
+}
+
+/// 转换文件 → Markdown，并带回转换过程中收集的提示与元信息
+pub fn convert_file(input: &Path, out_md: &Path, opts: &Options) -> Result<Converted, String> {
+    reset_report();
+    let r = convert_file_to_string(input, out_md, opts);
+    let rep = take_report();
+    r.map(|md| Converted {
+        md,
+        warnings: summarize(rep.warnings),
+        meta: rep.meta,
+    })
+}
+
 /// 把文件转换为 Markdown 字符串（不写盘；图片会写到 out_md 旁边的 _assets 目录）
 pub fn convert_bytes(ext: &str, data: &[u8], out_md: &Path, opts: &Options) -> Result<String, String> {
     // .md / .markdown 原样透传：保留行尾空格（Markdown 硬换行）与所有换行，不经过 tidy
@@ -474,32 +547,34 @@ pub fn convert_file_to_string(input: &Path, out_md: &Path, opts: &Options) -> Re
     convert_bytes(&ext, &data, out_md, opts)
 }
 
-/// 转换文件并写入 out_md；返回 (输出路径, Markdown 文本)
+/// 转换文件并写入 out_md；返回 (输出路径, 转换结果)
 pub fn convert_and_write(
     input: &Path,
     out_md: &Path,
     opts: &Options,
     overwrite: bool,
-) -> Result<(PathBuf, String), String> {
+) -> Result<(PathBuf, Converted), String> {
     if out_md.exists() && !overwrite {
         return Err(format!("目标已存在：{}（加 --force 覆盖）", out_md.display()));
     }
-    let mut md = convert_file_to_string(input, out_md, opts)?;
+    let mut conv = convert_file(input, out_md, opts)?;
     // front matter 只对「转换出来」的格式有意义；.md / .markdown 原样透传，不改变原文
     if opts.front_matter && !is_passthrough_ext(&ext_of(input)) {
-        md = front_matter_of(input, &md);
+        conv.md = front_matter_of(input, &conv.md, &conv.meta);
     }
     if let Some(parent) = out_md.parent() {
         if !parent.as_os_str().is_empty() {
             let _ = fs::create_dir_all(parent);
         }
     }
-    fs::write(out_md, md.as_bytes()).map_err(|e| format!("写入失败：{}", e))?;
-    Ok((out_md.to_path_buf(), md))
+    fs::write(out_md, conv.md.as_bytes()).map_err(|e| format!("写入失败：{}", e))?;
+    Ok((out_md.to_path_buf(), conv))
 }
 
-/// 在 Markdown 开头加 YAML 元信息
-pub fn front_matter_of(input: &Path, md: &str) -> String {
+/// 在 Markdown 开头加 YAML 元信息。
+/// extra 是转换器记录的附加信息（PDF 内部标题、页数等）：文件名常常和文档真实身份对不上
+/// （`…-v01-00.pdf` 的封面其实是 V1.5.0），溯源时要以文档自身的信息为准。
+pub fn front_matter_of(input: &Path, md: &str, extra: &[(String, String)]) -> String {
     let title = input
         .file_stem()
         .map(|s| s.to_string_lossy().into_owned())
@@ -508,13 +583,30 @@ pub fn front_matter_of(input: &Path, md: &str) -> String {
     // YAML 双引号字符串：反斜杠本身也要转义，否则 Windows 路径里的 \W 会被当成非法转义
     let esc = |s: &str| s.replace('\\', "\\\\").replace('"', "\\\"");
     let src = input.to_string_lossy().replace('\\', "/");
-    format!(
-        "---\ntitle: \"{}\"\nsource: \"{}\"\nconverted: {}\n---\n\n{}",
-        esc(&title),
-        esc(&src),
-        now,
-        md
-    )
+    let mut head = format!("---\ntitle: \"{}\"\nsource: \"{}\"\n", esc(&title), esc(&src));
+    for (k, v) in extra {
+        // 键名只允许字母数字与下划线；值里的控制字符（换行等）会破坏 YAML，换成空格
+        if k.is_empty() || !k.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+            continue;
+        }
+        let clean: String = v.chars().map(|c| if c.is_control() { ' ' } else { c }).collect();
+        let clean = clean.trim();
+        if clean.is_empty() {
+            continue;
+        }
+        if clean.chars().all(|c| c.is_ascii_digit()) {
+            head.push_str(&format!("{}: {}\n", k, clean));
+        } else {
+            head.push_str(&format!("{}: \"{}\"\n", k, esc(clean)));
+        }
+    }
+    head.push_str(&format!(
+        "converter: \"MDeditor {}\"\nconverted: {}\n---\n\n",
+        env!("CARGO_PKG_VERSION"),
+        now
+    ));
+    head.push_str(md);
+    head
 }
 
 fn chrono_like_now() -> String {

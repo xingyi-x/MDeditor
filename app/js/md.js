@@ -227,13 +227,35 @@
     await Promise.all(tasks);
   }
 
+  /* ── YAML front matter：只认文档最开头、`---` 起、`---` / `...` 止，且第一行是 `键:` 的块。
+   *    预览与导出都不渲染它 —— 否则 marked 会把它当成「分隔线 + 二级标题」显示；源码保持不变。
+   *    要求首行是 `键:`，免得把以分隔线 `---` 开头的普通文档整段吞掉。 */
+  const FRONT_MATTER_RE = /^\uFEFF?---[ \t]*\r?\n(?=[A-Za-z_][\w.-]*[ \t]*:)[\s\S]*?\r?\n(?:---|\.\.\.)[ \t]*(?:\r?\n|$)/;
+  const FRONT_MATTER_MAX = 20000;
+  function frontMatterOf(source) {
+    const m = FRONT_MATTER_RE.exec(String(source || ''));
+    return m && m[0].length <= FRONT_MATTER_MAX ? m[0] : '';
+  }
+  function stripFrontMatter(source) {
+    const s = String(source || '');
+    const fm = frontMatterOf(s);
+    return fm ? s.slice(fm.length) : s;
+  }
+  /** front matter 占用的源码行数（任务勾选、大纲按源码行号定位，要跳过这几行） */
+  function frontMatterLines(source) {
+    const fm = frontMatterOf(source);
+    if (!fm) return 0;
+    const n = (fm.match(/\n/g) || []).length;
+    return fm.endsWith('\n') ? n : n + 1;
+  }
+
   /* ── 主入口：源码 → DOM ── */
   async function render(source, targetEl, docDir) {
     init();
     slugCountReset();
     let html = '';
     try {
-      html = marked.parse(source || '', { async: false });
+      html = marked.parse(stripFrontMatter(source), { async: false });
     } catch (e) {
       html = `<p class="math-error">Markdown 解析出错：${U.esc(String(e.message || e))}</p>`;
     }
@@ -259,7 +281,7 @@
     const fenceRe = /^\s*(`{3,}|~{3,})/;
     let fence = null;
     const lines = String(source || '').split('\n');
-    for (let i = 0; i < lines.length; i++) {
+    for (let i = frontMatterLines(source); i < lines.length; i++) {
       const fm = fenceRe.exec(lines[i]);
       if (fm) {
         const mark = fm[1][0];
@@ -278,7 +300,9 @@
     const out = [];
     const fenceRe = /^\s*(`{3,}|~{3,})/;
     let fence = null;
+    const skip = frontMatterLines(source);   // YAML 里的 `# 注释` 不是标题
     source.split('\n').forEach((line, i) => {
+      if (i < skip) return;
       const fm = fenceRe.exec(line);
       if (fm) {
         const mark = fm[1][0];
@@ -296,5 +320,5 @@
     return out;
   }
 
-  MD.md = { render, parseOutline, taskLines, postprocess, imgCache, refreshMermaidTheme };
+  MD.md = { render, parseOutline, taskLines, postprocess, imgCache, refreshMermaidTheme, stripFrontMatter };
 })();
