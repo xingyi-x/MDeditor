@@ -114,7 +114,8 @@
     try {
       const to = U.joinPath(U.dirName(p), newName);
       await MD.fsx.rename(p, to);
-      if (state.currentFile === p) { state.currentFile = to; MD.bus.emit('doc:renamed', { from: p, to }); }
+      // 同步标签页里的路径 / 名称，并广播 doc:renamed 让状态栏与标题刷新
+      MD.docs.onExternalRename(p, to);
       await renderTree();
       MD.toast('已重命名');
     } catch (e) { MD.toast('重命名失败：' + e.message); }
@@ -123,7 +124,8 @@
     if (!confirm(`确定删除「${U.baseName(p)}」吗？文件将移入系统回收站，可还原。`)) return;
     try {
       await MD.fsx.remove(p);
-      if (state.currentFile === p) MD.bus.emit('doc:close-request');
+      // 带上路径：可能不是当前活动标签，但同样要关掉，否则自动保存会把文件写回来
+      MD.bus.emit('doc:close-request', p);
       await renderTree();
       MD.toast('已移入回收站');
     } catch (e) { MD.toast('删除失败：' + e.message); }
@@ -138,6 +140,9 @@
   /// 清空本机「最近打开」记录（数据只在本地 localStorage，不在仓库/安装包里）
   function clearRecent() {
     S().recentFiles = [];
+    // 上次会话的标签页列表同样是「本机打开记录」，一并清掉；当前打开着的标签页会重新写入
+    S().openDocs = [];
+    S().activeDoc = '';
     MD.saveSettings();
     renderRecent();
   }
@@ -276,6 +281,18 @@
   }
   function escapeReg(s) { return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); }
 
+  /* ══════════ 文件树选中态 ══════════ */
+  /** 只更新高亮，不重新读目录：切换标签页是高频操作，不能每次都打一次磁盘 */
+  function highlightActive() {
+    const p = state.currentFile;
+    U.$$('#filetree .tree-item.file').forEach((el) => {
+      el.classList.toggle('active', !!p && el.dataset.file === p);
+    });
+    U.$$('#recent-list .tree-item.file').forEach((el) => {
+      el.classList.toggle('active', !!p && el.dataset.file === p);
+    });
+  }
+
   /* ══════════ 欢迎页 ══════════ */
   function renderWelcome() {
     const w = U.$('#welcome');
@@ -347,8 +364,14 @@
     renderRecent();
     renderWelcome();
     MD.bus.on('folder:opened', renderTree);
-    MD.bus.on('doc:opened', () => { hideWelcome(); renderTree(); renderOutline(); });
-    MD.bus.on('doc:closed', () => { renderTree(); renderWelcome(); renderOutline(); });
+    // 打开 / 切换标签页：只做轻量同步（欢迎页、树高亮、大纲），不重读磁盘
+    MD.bus.on('doc:opened', () => { hideWelcome(); highlightActive(); renderOutline(); });
+    MD.bus.on('doc:closed', (info) => {
+      // 全部标签关完才回到欢迎页
+      if (!info || !info.remaining) { hideWelcome(); renderTree(); renderWelcome(); }
+      else highlightActive();
+      renderOutline();
+    });
     MD.bus.on('render:done', () => {
       const active = U.$('.side-tabs button.active');
       if (active && active.dataset.sideTab === 'outline') renderOutline();
@@ -356,7 +379,7 @@
   }
 
   MD.panels = {
-    init, renderTree, renderRecent, renderOutline, renderWelcome, pushRecent, clearRecent,
+    init, renderTree, renderRecent, renderOutline, renderWelcome, pushRecent, clearRecent, highlightActive,
     get currentFolder() { return state.currentFolder; },
     setFolder(p) { state.currentFolder = p; MD.bus.emit('folder:opened', p); },
   };

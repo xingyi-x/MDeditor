@@ -180,6 +180,68 @@ html[data-view="preview"] #fmt-toolbar, html[data-view="read"] #fmt-toolbar { di
 .menu-label { font-size: 11px; color: var(--ui-muted); padding: 5px 10px 2px; }
 .menu-pop .checked::after { content: "✓"; margin-left: 8px; }
 
+/* ══════════ 文档标签栏（多文件快速切换） ══════════ */
+#tabbar {
+  flex: none;
+  display: flex;
+  align-items: stretch;
+  height: 34px;
+  padding-left: 4px;
+  background: var(--ui-bg-3);
+  border-bottom: 1px solid var(--ui-border);
+  user-select: none;
+}
+#tab-list {
+  position: relative;   /* 让 .tab 的 offsetLeft 相对标签栏计算（滚动到可见区域用） */
+  display: flex;
+  align-items: stretch;
+  flex: 1;
+  min-width: 0;
+  overflow-x: auto;
+  overflow-y: hidden;
+  scrollbar-width: none;
+}
+#tab-list::-webkit-scrollbar { display: none; }
+.tab {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  flex: 0 1 auto;          /* 按文件名长短自适应，标签多到放不下时才收缩 */
+  min-width: 84px;
+  max-width: 220px;
+  padding: 0 5px 0 10px;
+  border: none;
+  border-right: 1px solid var(--ui-border);
+  background: transparent;
+  color: var(--ui-muted);
+  font-size: 12.5px;
+  cursor: pointer;
+}
+.tab:hover { background: var(--ui-hover); color: var(--ui-fg); }
+.tab.active { background: var(--ui-bg-2); color: var(--ui-fg); }
+.tab.active::before { content: ""; position: absolute; left: 0; right: 0; top: 0; height: 2px; background: var(--ui-accent); }
+.tab-title { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; text-align: left; }
+.tab-dot { flex: none; width: 6px; height: 6px; border-radius: 50%; background: var(--ui-accent); opacity: 0; transition: opacity 0.12s; }
+.tab.dirty .tab-dot { opacity: 1; }
+.tab-close {
+  flex: none; width: 18px; height: 18px;
+  display: inline-flex; align-items: center; justify-content: center;
+  border-radius: 4px; font-size: 10px; line-height: 1; opacity: 0.55;
+}
+.tab-close:hover { background: var(--ui-active); opacity: 1; }
+.tab-aux {
+  flex: none; width: 26px; height: 100%;
+  border: none; border-left: 1px solid var(--ui-border);
+  background: transparent; color: var(--ui-muted);
+  font-size: 13px; cursor: pointer;
+}
+.tab-aux:hover { background: var(--ui-hover); color: var(--ui-fg); }
+#tab-menu { min-width: 200px; max-width: 420px; max-height: 60vh; overflow-y: auto; }
+#tab-menu .tab-menu-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* 阅读模式只留正文：标签栏属于编辑器外壳，跟顶栏一起收起 */
+html[data-view="read"] #tabbar { display: none; }
+
 /* ══════════ 主区布局 ══════════ */
 #main { flex: 1; display: flex; min-height: 0; }
 

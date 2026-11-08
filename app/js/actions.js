@@ -10,6 +10,8 @@
     const el = U.$('#st-save');
     if (state.dirty) { el.textContent = '● 未保存'; el.classList.add('dirty'); }
     else { el.textContent = '已保存'; el.classList.remove('dirty'); }
+    // 标签页上的脏点：内部会判断是否真的变化，不会在每次按键时重建 DOM
+    if (MD.docs) MD.docs.setActiveDirty(state.dirty);
     MD.app.updateWindowTitle();
   }
   MD.bus.on('doc:changed', () => markDirty(true));
@@ -21,25 +23,32 @@
   }
 
   /* ══════════ 新建 ══════════ */
+  /** 新建一个未命名标签页；已有标签页不动（多标签下不需要「放弃当前文档」的确认） */
   async function newFile(inDir) {
-    if (state.dirty && !confirm('当前文档未保存，确定放弃并新建吗？')) return;
     ensureEditable();
-    state.currentFile = null;
-    state.currentDir = inDir || null;
-    MD.editor.value = MD.defaults.newDocTemplate || '# 未命名文档\n\n';
+    MD.docs.newDoc(inDir);
     MD.editor.focus();
-    MD.bus.emit('doc:opened', null);
-    markDirty(false);
-    MD.app.renderPreview();
   }
 
   /* ══════════ 打开 ══════════ */
   async function openFileDialog() {
-    const p = await MD.fsx.pickFile([
+    const filters = [
       { name: 'Markdown', extensions: ['md', 'markdown'] },
       { name: '所有文件', extensions: ['*'] },
-    ]);
-    if (p) openFile(p);
+    ];
+    // 支持一次多选：每个文件各占一个标签页
+    const list = MD.fsx.pickFiles
+      ? await MD.fsx.pickFiles(filters)
+      : [await MD.fsx.pickFile(filters)].filter(Boolean);
+    const paths = (list || []).filter(Boolean);
+    if (!paths.length) return;
+    const md = paths.filter((p) => U.isMarkdown(p) || U.ext(p) === 'txt');
+    const others = paths.filter((p) => !md.includes(p));
+    for (const p of md) await openFile(p);
+    for (const p of others) {
+      if (isConvertible(p)) await importFile(p);
+      else MD.toast('不支持的文件类型：' + U.baseName(p));
+    }
   }
   async function openFolderDialog() {
     const p = await MD.fsx.pickFolder();
@@ -88,7 +97,7 @@
       } else {
         MD.toast('已转换：' + U.baseName(outPath));
       }
-      await openFile(outPath);
+      await openFile(outPath, { reload: true });
     } catch (e) {
       MD.toast('转换失败：' + (e && e.message ? e.message : e));
     }
@@ -102,29 +111,55 @@
     if (p) await importFile(p);
   }
 
-  async function openFile(path) {
-    if (state.dirty && !confirm('当前文档未保存，确定放弃并打开新文件吗？')) return;
+  /**
+   * 打开文件 → 独占一个标签页。
+   * 同一路径已经打开时只切过去（不重复读盘、不再问「放弃未保存修改」：
+   * 非活动标签的内容一直留在内存里，不需要放弃）。
+   */
+  async function openFile(path, opts) {
+    if (!path) return;
+    const o = opts || {};
+    const exist = MD.docs.findByPath(path);
+    if (exist && !o.reload) {
+      ensureEditable();
+      MD.docs.activate(exist.id);
+      saveFolderFor(exist.path);
+      MD.editor.focus();
+      return exist;
+    }
     ensureEditable();
     try {
       const text = await MD.fsx.readFile(path);
-      state.currentFile = path;
-      state.currentDir = U.dirName(path);
-      MD.editor.value = text;
-      MD.panels.pushRecent(path);
-      if (!MD.panels.currentFolder && MD.fsx.isApp) {
-        const dir = U.dirName(path);
-        MD.panels.setFolder(dir);
-        // 自动设置文件夹时一并记住，供下次启动「恢复上次文件夹」
-        MD.settings.lastFolder = dir;
-        MD.saveSettings();
+      // 文件刚被外部改写（例如刚导出 / 转换出的同名 .md）：刷新已有标签的缓冲区
+      if (exist && o.reload) {
+        MD.docs.activate(exist.id, { noRecheck: true });
+        if (exist.dirty) {
+          MD.toast('该文件已在标签页中打开，已保留未保存的修改');
+          return exist;
+        }
+        MD.docs.reloadBuffer(exist.id, text, await MD.docs.mtimeOf(path));
+        return exist;
       }
-      MD.bus.emit('doc:opened', path);
-      markDirty(false);
-      MD.app.renderPreview();
+      const mtime = await MD.docs.mtimeOf(path);
+      MD.docs.add({ path, text, mtime });
+      MD.panels.pushRecent(path);
+      saveFolderFor(path);
       MD.editor.focus();
+      return MD.docs.active();
     } catch (e) {
-      MD.toast('打开失败：' + e.message);
+      MD.toast('打开失败：' + (e && e.message ? e.message : e));
+      return null;
     }
+  }
+
+  /** 还没有打开文件夹时，用第一个文件的所在目录作为文件树根 */
+  function saveFolderFor(path) {
+    if (MD.panels.currentFolder || !MD.fsx.isApp) return;
+    const dir = U.dirName(path);
+    if (!dir) return;
+    MD.panels.setFolder(dir);
+    MD.settings.lastFolder = dir;
+    MD.saveSettings();
   }
 
   /* ══════════ 保存 ══════════ */
@@ -134,10 +169,15 @@
     return !gen || !!(cm && cm.isClean && cm.isClean(gen));
   }
   async function save() {
-    if (!state.currentFile) return saveAs();
+    const d = MD.docs.active();
+    if (!d) { MD.toast('当前没有打开的文档'); return; }
+    if (!d.path) return saveAs();
     const gen = MD.editor.cm && MD.editor.cm.changeGeneration ? MD.editor.cm.changeGeneration() : null;
+    const text = MD.editor.value;
     try {
-      await MD.fsx.writeFile(state.currentFile, MD.editor.value);
+      await MD.fsx.writeFile(d.path, text);
+      d.text = text;                 // 缓冲区的磁盘快照，供切走后自动保存 / 关闭时使用
+      MD.docs.afterWrite(d);
       if (isCleanSince(gen)) {
         MD.bus.emit('doc:saved');
         MD.toast('已保存');
@@ -145,46 +185,46 @@
         // 写盘期间又有输入：磁盘是旧快照，不能清脏，留给下一次自动保存补写
         MD.toast('保存期间文档又有修改，已保留未保存状态');
       }
-    } catch (e) { MD.toast('保存失败：' + e.message); }
+    } catch (e) { MD.toast('保存失败：' + (e && e.message ? e.message : e)); }
   }
   async function saveAs() {
-    const name = state.currentFile ? U.baseName(state.currentFile) : '未命名.md';
+    const d = MD.docs.active();
+    if (!d) { MD.toast('当前没有打开的文档'); return; }
+    const name = d.name || '未命名.md';
     const p = await MD.fsx.pickSaveFile(name, [
       { name: 'Markdown', extensions: ['md', 'markdown'] },
     ]);
     if (!p) return;
+    // 同一个文件不能同时挂在两个标签上，否则两边保存会互相覆盖
+    const other = MD.docs.findByPath(p);
+    if (other && other !== d) {
+      MD.toast('「' + other.name + '」已在该文件的标签页中打开，请改用其它文件名');
+      return;
+    }
     const gen = MD.editor.cm && MD.editor.cm.changeGeneration ? MD.editor.cm.changeGeneration() : null;
+    const text = MD.editor.value;
     try {
-      await MD.fsx.writeFile(p, MD.editor.value);
-      state.currentFile = p;
-      state.currentDir = U.dirName(p);
+      await MD.fsx.writeFile(p, text);
+      d.text = text;
+      MD.docs.renamePath(d.id, p);
       MD.panels.pushRecent(p);
-      MD.bus.emit('doc:opened', p);
+      // 另存为可能是在文件树当前目录里新建了一个文件，刷新一下让它在树里可见
+      if (MD.panels.renderTree) MD.panels.renderTree();
       if (isCleanSince(gen)) {
         MD.bus.emit('doc:saved');
         MD.toast('已保存');
       } else {
         MD.toast('保存期间文档又有修改，已保留未保存状态');
       }
-    } catch (e) { MD.toast('保存失败：' + e.message); }
+    } catch (e) { MD.toast('保存失败：' + (e && e.message ? e.message : e)); }
   }
+  /** 关闭当前标签页（有未保存修改时逐个确认） */
   function closeDoc() {
-    if (state.dirty && !confirm('当前文档未保存，确定关闭吗？')) return;
-    resetDoc();
+    return MD.docs.closeActive();
   }
   /** 不做未保存确认的关闭（文件已被删除等场景由调用方保证） */
   function closeDocForce() {
-    resetDoc();
-    MD.toast('当前文件已被删除，已关闭');
-  }
-  function resetDoc() {
-    state.currentFile = null;
-    state.currentDir = null;
-    MD.editor.value = '';
-    markDirty(false);              // 清脏标记 + 状态栏 + 窗口标题
-    MD.bus.emit('doc:closed');
-    MD.bus.emit('doc:opened', null); // 让状态栏路径 / 标题刷新
-    MD.app.renderPreview();
+    return MD.docs.closeActive({ force: true });
   }
 
   /* ══════════ 图片：粘贴 / 拖入 ══════════ */
@@ -664,7 +704,7 @@ ${wordMode ? '' : `<div style="text-align:center;color:#9ca3af;font-size:12px;ma
 
   MD.actions = {
     newFile, newFileIn: newFile, openFileDialog, openFolderDialog, openFile,
-    importFile, importAsMarkdown, isConvertible,
+    importFile, importAsMarkdown, isConvertible, markDirty,
     save, saveAs, closeDoc, closeDocForce, handleImageFile, handleImageDataURL, handleDrop,
     exportPDF, exportPDFTo, exportPdfTo, printDoc, exportHTML, exportWord, exportTXT, exportTheme,
     toPlainText, flattenVars,

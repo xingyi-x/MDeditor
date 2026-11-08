@@ -129,6 +129,9 @@ MD.defaults = {
   // 状态
   lastFolder: '',
   recentFiles: [],             // [{path,name,time}]
+  restoreTabs: true,           // 启动时恢复上次打开的标签页
+  openDocs: [],                // 上次打开的文件路径（仅路径，不含内容）
+  activeDoc: '',               // 上次的活动标签
   settingsVersion: 2,
 };
 

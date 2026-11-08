@@ -888,6 +888,7 @@
       <div class="ctl-row"><label>自动保存</label><label class="chk"><input type="checkbox" id="se-autosave" ${s.autoSave ? 'checked' : ''}>修改 1.5 秒后自动写回文件</label></div>
       <div class="ctl-row"><label>打字机滚动</label><label class="chk"><input type="checkbox" id="se-tw" ${s.typewriter ? 'checked' : ''}>光标始终保持在屏幕中部</label></div>
       <div class="ctl-row"><label>粘贴图片</label><label class="chk"><input type="checkbox" id="se-img" ${s.pasteImageToLocal ? 'checked' : ''}>粘贴/拖入图片保存到文档旁 assets 文件夹</label></div>
+      <div class="ctl-row"><label>启动恢复</label><label class="chk"><input type="checkbox" id="se-restore-tabs" ${s.restoreTabs ? 'checked' : ''}>启动时重新打开上次的标签页</label></div>
       <hr class="ctl-sep">
       <div class="ctl-title">文件关联</div>
       <div class="ctl-row"><label>.md 打开方式</label>
@@ -901,7 +902,7 @@
       <hr class="ctl-sep">
       <div class="ctl-title">关于</div>
       <div style="color:var(--ui-muted);line-height:2;font-size:12.5px">
-        MDeditor <span id="se-version">v1.3</span> —— 本地 Markdown 阅读与排版编辑器<br>
+        MDeditor <span id="se-version">v1.6</span> —— 本地 Markdown 阅读与排版编辑器<br>
         运行环境：${MD.fsx.isApp ? 'MDeditor 桌面应用（Tauri）' : '浏览器模式（部分功能受限）'}<br>
         所有文件均保存在本地，不上传任何数据。<br>
         渲染内核：marked + highlight.js + KaTeX + Mermaid + paged.js
@@ -943,6 +944,7 @@
     U.$('#se-autosave', body).addEventListener('change', (e) => { MD.settings.autoSave = e.target.checked; MD.saveSettings(); });
     U.$('#se-tw', body).addEventListener('change', (e) => { MD.app.setTypewriter(e.target.checked); });
     U.$('#se-img', body).addEventListener('change', (e) => { MD.settings.pasteImageToLocal = e.target.checked; MD.saveSettings(); });
+    U.$('#se-restore-tabs', body).addEventListener('change', (e) => { MD.settings.restoreTabs = e.target.checked; MD.saveSettings(); });
     U.$('#se-help', body).addEventListener('click', () => { U.$('#settings-modal').hidden = true; MD.app.showHelp(); });
 
     // 文件关联
@@ -972,8 +974,11 @@
   function showHelp() {
     const body = U.$('#help-body');
     const rows = [
-      ['Ctrl+S', '保存'], ['Ctrl+N', '新建文档'], ['Ctrl+O', '打开文件'],
+      ['Ctrl+S', '保存'], ['Ctrl+N', '新建文档'], ['Ctrl+O', '打开文件（可多选）'],
       ['Ctrl+Shift+O', '打开文件夹'], ['Ctrl+Alt+O', '导入 PDF/Word 等为 Markdown'],
+      ['Ctrl+Tab / Ctrl+PageDown', '切换到下一个标签页'],
+      ['Ctrl+Shift+Tab / Ctrl+PageUp', '切换到上一个标签页'],
+      ['Ctrl+W', '关闭当前标签页'],
       ['Ctrl+B / Ctrl+I', '加粗 / 斜体'],
       ['Ctrl+K', '插入链接'], ['Ctrl+1..4', '一/二/三/四级标题'],
       ['Ctrl+Shift+Q', '引用'], ['Ctrl+F / Ctrl+H', '查找 / 替换（编辑器内）'],

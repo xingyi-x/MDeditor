@@ -2,9 +2,9 @@
 
 @media print {
   /* 只打印预览内容 */
-  body > #topbar, body > #main > #sidebar, body > #main > #sidebar-splitter,
+  body > #topbar, body > #tabbar, body > #main > #sidebar, body > #main > #sidebar-splitter,
   body > #main > #workspace > #editor-pane, body > #main > #workspace > #vsplitter,
-  #statusbar, #layout-panel, .modal-mask, #toast, #welcome { display: none !important; }
+  #statusbar, #layout-panel, .modal-mask, #toast, #tab-menu, #welcome { display: none !important; }
 
   html, body { height: auto; overflow: visible; background: #fff !important; }
 

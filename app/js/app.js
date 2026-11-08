@@ -12,10 +12,12 @@
     const text = MD.editor.value;
     const preview = U.$('#preview');
     const welcome = U.$('#welcome');
-    const empty = text.trim() === '' && !state.currentFile;
-    welcome.hidden = !empty;
-    preview.hidden = empty;
-    if (empty) { updateCounts(''); return; }
+    // 「一个文档都没有」才显示欢迎页：多标签下关掉其中一个不应跳回欢迎页。
+    // 未命名但已有内容的文档同样按正常文档渲染。
+    const noDoc = MD.docs ? MD.docs.count() === 0 : (text.trim() === '' && !state.currentFile);
+    welcome.hidden = !noDoc;
+    preview.hidden = noDoc;
+    if (noDoc) { updateCounts(''); return; }
     try {
       await MD.md.render(text, preview, state.currentDir);
     } catch (e) {
@@ -63,16 +65,18 @@
   }
 
   function updateStatusBar() {
-    const p = state.currentFile;
+    const d = MD.docs ? MD.docs.active() : null;
+    const p = d && d.path ? d.path : '';
     const el = U.$('#st-path');
-    el.textContent = p || '';
+    el.textContent = p || (d ? '新文档（未保存）' : '');
     el.title = p || '';
   }
 
   /* ══════════ 状态栏 / 窗口标题 ══════════ */
   let _lastTitle = '';
   const _titleTick = U.debounce(() => {
-    const name = state.currentFile ? U.baseName(state.currentFile) : '未命名';
+    const d = MD.docs ? MD.docs.active() : null;
+    const name = d ? d.name : (state.currentFile ? U.baseName(state.currentFile) : '未命名');
     const dirty = state.dirty ? ' ●' : '';
     const t = `MDeditor — ${name}${dirty}`;
     if (t === _lastTitle) return;
@@ -362,6 +366,13 @@
       else if (mod && k === 's') { e.preventDefault(); MD.actions.save(); }
       else if (mod && k === 'n') { e.preventDefault(); MD.actions.newFile(); }
       else if (mod && k === 'o') { e.preventDefault(); MD.actions.openFileDialog(); }
+      // 标签页：Ctrl+Tab / Ctrl+PageDown 前后切换，Ctrl+W 关闭当前标签
+      else if (mod && e.key === 'Tab') { e.preventDefault(); MD.docs.cycle(e.shiftKey ? -1 : 1); }
+      else if (mod && (k === 'pagedown' || k === 'pageup')) {
+        e.preventDefault();
+        MD.docs.cycle(k === 'pagedown' ? 1 : -1);
+      }
+      else if (mod && k === 'w') { e.preventDefault(); MD.docs.closeActive(); }
       else if (mod && k === 'p') { e.preventDefault(); MD.actions.exportPDF(); }
       else if (mod && e.key === '\\') { e.preventDefault(); toggleSidebar(); }
       else if (e.altKey && k === '1') { e.preventDefault(); setView('source'); }
@@ -450,29 +461,37 @@
     }
   }
 
-  /** 处理拖入的文件路径（桌面版：拿到的是真实路径） */
+  /** 处理拖入的文件路径（桌面版：拿到的是真实路径）
+   *  多标签之后不再「只开第一个」：.md/.txt 每个文件各开一个标签页。 */
   async function openDroppedPaths(paths) {
     const list = (paths || []).filter(Boolean);
     if (!list.length) return;
-    if (list.length > 1) MD.toast(`拖入了 ${list.length} 个文件，打开第一个`);
-    const first = list[0];
-    const ext = U.ext(first);
+    const images = list.filter((p) => IMG_EXTS.includes(U.ext(p)));
+    const docs = list.filter((p) => U.isMarkdown(p) || U.ext(p) === 'txt');
+    const converts = list.filter((p) => !images.includes(p) && !docs.includes(p) && MD.actions.isConvertible(p));
+    const rest = list.filter((p) => !images.includes(p) && !docs.includes(p) && !converts.includes(p));
 
-    // 图片 → 插入到当前文档
-    if (IMG_EXTS.includes(ext)) {
-      if (!state.currentFile) { MD.toast('请先打开或新建一篇文档，再拖入图片'); return; }
-      try {
-        const url = await MD.fsx.readImageDataURL(first);
-        handleDroppedImage(url, U.baseName(first));
-        MD.toast('已插入图片 ' + U.baseName(first));
-      } catch (err) { MD.toast('读取图片失败：' + (err.message || err)); }
-      return;
+    // 图片 → 插入当前文档
+    if (images.length) {
+      if (!state.currentFile && !MD.editor.value.trim()) {
+        MD.toast('请先打开或新建一篇文档，再拖入图片');
+      } else {
+        for (const p of images) {
+          try {
+            const url = await MD.fsx.readImageDataURL(p);
+            handleDroppedImage(url, U.baseName(p));
+            MD.toast('已插入图片 ' + U.baseName(p));
+          } catch (err) { MD.toast('读取图片失败：' + (err.message || err)); }
+        }
+      }
     }
-    if (U.isMarkdown(first)) { await MD.actions.openFile(first); return; }
-    if (ext === 'txt') { await MD.actions.openFile(first); return; }
-    // PDF / Word / Excel / PPT / HTML / RTF / CSV → 转成 Markdown 再打开
-    if (MD.actions.isConvertible(first)) { await MD.actions.importFile(first); return; }
-    MD.toast('不支持的文件类型：' + U.baseName(first));
+    // Markdown / 纯文本 → 每个文件一个标签页
+    for (const p of docs) await MD.actions.openFile(p);
+    // PDF / Word / Excel / PPT / HTML / RTF / CSV → 转成 Markdown 后打开
+    // 转换较慢，一次最多处理 3 个，其余明确告知，避免长时间无反馈
+    for (const p of converts.slice(0, 3)) await MD.actions.importFile(p);
+    if (converts.length > 3) MD.toast(`另有 ${converts.length - 3} 个可转换文件未处理，请逐个拖入`);
+    if (rest.length) MD.toast('不支持的文件类型：' + rest.map((p) => U.baseName(p)).join('、'));
   }
 
   /** 桌面版：Tauri 2 的拖放事件是发给具体 webview 的，必须走 onDragDropEvent
@@ -562,30 +581,41 @@
     MD.actions.handleImageDataURL(dataURL, name);
   }
 
-  /* ══════════ 自动保存 ══════════ */
+  /* ══════════ 自动保存 ══════════
+     多标签下必须记住「是哪个文档触发的这次保存」：1.5 秒内切换标签时，
+     定时器到点后活动文档已经换人，只有用 docId 定位才不会把 A 的内容写进 B 的文件。 */
   let _autoSaveFailed = false;
-  const autoSave = U.debounce(() => {
-    if (MD.settings.autoSave && state.currentFile && state.dirty) {
-      const gen = MD.editor.cm && MD.editor.cm.changeGeneration ? MD.editor.cm.changeGeneration() : null;
-      MD.fsx.writeFile(state.currentFile, MD.editor.value)
-        .then(() => {
-          _autoSaveFailed = false;
-          const cm = MD.editor.cm;
+  const autoSave = U.debounce((docId) => {
+    if (!MD.settings.autoSave) return;
+    const d = MD.docs.byId(docId);
+    if (!d || !d.path || !d.dirty) return;
+    const isActive = MD.docs.active() === d;
+    const cm = isActive ? MD.editor.cm : null;
+    const text = isActive ? MD.editor.value : d.text;
+    const gen = cm && cm.changeGeneration ? cm.changeGeneration() : null;
+    MD.fsx.writeFile(d.path, text)
+      .then(() => {
+        _autoSaveFailed = false;
+        MD.docs.afterWrite(d);
+        if (isActive) {
           // 写盘期间又改过：磁盘是旧快照，不清脏，留给下一次自动保存补写
-          if (!gen || (cm && cm.isClean && cm.isClean(gen))) {
+          if (!gen || (cm.isClean && cm.isClean(gen))) {
             MD.bus.emit('doc:saved');
           } else {
             MD.toast('保存期间文档又有修改，已保留未保存状态');
           }
-        })
-        .catch((e) => {
-          // 不要静默失败：文件只读/被占用时用户必须知道内容没写进磁盘
-          if (!_autoSaveFailed) {
-            _autoSaveFailed = true;
-            MD.toast('自动保存失败：' + (e && e.message ? e.message : e));
-          }
-        });
-    }
+        } else {
+          // 非活动文档：写下去的就是切换前的快照，直接标记为已保存
+          MD.docs.setDirtyById(d.id, false);
+        }
+      })
+      .catch((e) => {
+        // 不要静默失败：文件只读/被占用时用户必须知道内容没写进磁盘
+        if (!_autoSaveFailed) {
+          _autoSaveFailed = true;
+          MD.toast('自动保存失败：' + (e && e.message ? e.message : e));
+        }
+      });
   }, 1500);
 
   /* ══════════ 外部修改检测（低频轮询，仅桌面版真实文件） ══════════
@@ -617,10 +647,16 @@
 
   /** 用磁盘内容替换编辑器。MD.editor.value 的 setter 已 clearHistory + markClean
       并抑制 doc:changed；再借 doc:saved（现有事件）把 dirty 置 false 并重建基准。 */
-  async function reloadFromDisk(path) {
+  async function reloadFromDisk(path, mtime) {
     try {
       const text = await MD.fsx.readFile(path);
+      const d = MD.docs.active();
       MD.editor.value = text;
+      // 文档记录的文本与 mtime 必须一起对齐，否则切走再切回来会按旧基准重读一次
+      if (d && MD.docs.samePath(d.path, path)) {
+        d.text = text;
+        if (mtime != null) d.mtime = mtime;
+      }
       MD.bus.emit('doc:saved');
       MD.app.renderPreview();
       MD.toast('文件已在外部更新，已重新加载');
@@ -645,7 +681,7 @@
       if (state.dirty && !confirm('文件已在外部被修改，是否放弃本地未保存修改并重新加载？')) {
         return;                       // 取消：保留本地未保存修改，基准已更新
       }
-      await reloadFromDisk(path);
+      await reloadFromDisk(path, m);
     } finally {
       watchBusy = false;
     }
@@ -675,18 +711,25 @@
     } else {
       // 浏览器模式兜底（桌面版走原生拦截）
       window.addEventListener('beforeunload', (e) => {
-        if (state.dirty) { e.preventDefault(); e.returnValue = ''; }
+        if (MD.docs.anyDirty()) { e.preventDefault(); e.returnValue = ''; }
       });
     }
   }
 
   function onCloseRequested() {
     if (closing) return;
-    if (!state.dirty) { MD.fsx.quit(); return; }   // 无未保存修改：直接退出
+    const dirty = MD.docs.dirtyDocs();
+    if (!dirty.length) { MD.fsx.quit(); return; }   // 没有未保存修改：直接退出
     closing = true;
     const mask = U.$('#close-modal');
-    if (mask) mask.hidden = false;
-    else MD.fsx.quit();   // 弹窗缺失时不让用户卡住
+    if (!mask) { MD.fsx.quit(); return; }           // 弹窗缺失时不让用户卡住
+    const tip = U.$('.modal-text', mask);
+    if (tip) {
+      tip.textContent = dirty.length > 1
+        ? `有 ${dirty.length} 个文档存在未保存的修改。`
+        : '当前文档有未保存的修改。';
+    }
+    mask.hidden = false;
   }
 
   async function finishClose(action) {
@@ -696,13 +739,12 @@
       return;
     }
     if (action === 'save') {
-      try {
-        await MD.actions.save();          // 取消「另存为」会走到这里，dirty 保持 true
-      } catch (e) {
-        MD.toast('保存失败：' + ((e && e.message) || e));
-        return;                           // 留在窗口，绝不带着未保存内容退出
+      // 逐个保存：未命名的文档会弹「另存为」，用户取消即中止退出
+      for (const d of MD.docs.dirtyDocs()) {
+        await MD.docs.activate(d.id);
+        await MD.actions.save();            // 失败/取消时 dirty 保持 true
+        if (state.dirty) { MD.toast('尚未保存成功，已取消退出'); return; }
       }
-      if (state.dirty) { MD.toast('尚未保存成功，已取消退出'); return; }
     }
     await MD.fsx.quit();
   }
@@ -722,6 +764,7 @@
     MD.editor.setTypewriter(s.typewriter);
     MD.panels.init();
     bindMenus();
+    MD.docs.init();
     bindActions();
     bindViewSwitch();
     bindFmt();
@@ -740,16 +783,20 @@
       renderNow();
       scheduleUpdateCounts();
       updateStatusBar();
-      autoSave();
+      autoSave(MD.docs.activeId);          // 只保存「产生这次修改」的文档
     });
     MD.bus.on('cursor:moved', (pos) => {
       U.$('#st-cursor').textContent = `行 ${pos.line + 1}，列 ${pos.ch + 1}`;
     });
     MD.bus.on('doc:opened', () => { updateStatusBar(); updateWindowTitle(); refreshWatchBaseline(); });
     MD.bus.on('doc:saved', () => { updateWindowTitle(); refreshWatchBaseline(); });
-    // 文件树里删掉当前正在编辑的文件：必须清空当前文件引用，
+    // 文件树里删掉正在编辑的文件：必须把这个标签页关掉并清掉文件引用，
     // 否则 1.5 秒后的自动保存会把已删除的文件又写回磁盘（"文件复活"）。
-    MD.bus.on('doc:close-request', () => { MD.actions.closeDocForce(); });
+    MD.bus.on('doc:close-request', (path) => {
+      const p = typeof path === 'string' ? path : state.currentFile;
+      if (!p) return;
+      if (MD.docs.closeByPath(p, { force: true })) MD.toast('文件已被删除，标签页已关闭');
+    });
     MD.bus.on('doc:renamed', () => { updateStatusBar(); updateWindowTitle(); refreshWatchBaseline(); });
     MD.bus.on('theme:applied', () => {
       U.$('#st-theme').textContent = (MD.theme.getTheme(MD.settings.docTheme).name || '主题');
@@ -774,11 +821,17 @@
           if (await MD.fsx.exists(s.lastFolder)) MD.panels.setFolder(s.lastFolder);
         } catch (e) { /* ignore */ }
       }
-      renderNow();
+      // 恢复上次打开的标签页；没有可恢复的内容再退回「空工作区 + 欢迎页」
+      let restored = 0;
+      if (s.restoreTabs && Array.isArray(s.openDocs) && s.openDocs.length) {
+        try { restored = await MD.docs.restore(s.openDocs, s.activeDoc); }
+        catch (e) { console.warn('恢复标签页失败', e); }
+      }
+      if (!restored) renderNow();
     }
 
-    // 无文档时预览区显示欢迎页
-    if (!MD.editor.value.trim()) {
+    // 一个文档都没有时才显示欢迎页
+    if (MD.docs.count() === 0) {
       U.$('#welcome').hidden = false;
       U.$('#preview').hidden = true;
     }

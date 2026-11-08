@@ -99,6 +99,14 @@
       const r = await window.__TAURI__.dialog.open(opt);
       return Array.isArray(r) ? r[0] : r;
     },
+    /** 多选（一次打开多个文件 → 各自一个标签页） */
+    async pickFiles(filters) {
+      try {
+        const r = await window.__TAURI__.dialog.open({ multiple: true, filters: filters || [] });
+        if (!r) return [];
+        return Array.isArray(r) ? r : [r];
+      } catch (e) { return []; }
+    },
     async pickSaveFile(defaultName, filters) {
       return window.__TAURI__.dialog.save({ defaultPath: defaultName, filters: filters || [] });
     },
@@ -309,6 +317,20 @@
       const p = '/' + h.name;
       bState.handles.set(p, h);
       return p;
+    },
+    async pickFiles() {
+      if (!window.showOpenFilePicker) { MD.toast('当前浏览器不支持文件选择器，请使用拖拽打开'); return []; }
+      try {
+        const list = await window.showOpenFilePicker({
+          multiple: true,
+          types: [{ description: 'Markdown', accept: { 'text/markdown': ['.md', '.markdown'] } }],
+        });
+        return list.map((h) => {
+          const p = '/' + h.name;
+          bState.handles.set(p, h);
+          return p;
+        });
+      } catch (e) { return []; }
     },
     async pickSaveFile(defaultName) {
       if (!window.showSaveFilePicker) return null;
