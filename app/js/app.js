@@ -651,11 +651,11 @@
     try {
       const text = await MD.fsx.readFile(path);
       const d = MD.docs.active();
-      MD.editor.value = text;
-      // 文档记录的文本与 mtime 必须一起对齐，否则切走再切回来会按旧基准重读一次
       if (d && MD.docs.samePath(d.path, path)) {
-        d.text = text;
-        if (mtime != null) d.mtime = mtime;
+        // 统一走 reloadBuffer：文本、mtime 一起对齐，并丢掉对新内容无效的旧撤销历史
+        MD.docs.reloadBuffer(d.id, text, mtime);
+      } else {
+        MD.editor.value = text;
       }
       MD.bus.emit('doc:saved');
       MD.app.renderPreview();
