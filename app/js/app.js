@@ -697,6 +697,57 @@
     setTimeout(tick, EXTERNAL_POLL_MS);
   }
 
+  /* ══════════ 第二个实例转发过来的文件 ══════════ */
+  // 已有窗口在跑时双击另一个 .md，第二个进程通过命名管道把路径交给这里，
+  // 由本窗口新开标签，而不是弹「已在运行」再把用户丢回去手动打开。
+  let openQueueBusy = false;
+  let openQueueAgain = false;      // 处理期间又来了一次请求：取空后再补一轮
+
+  function bindOpenFiles() {
+    const T = window.__TAURI__ || {};
+    if (T.event && typeof T.event.listen === 'function') {
+      T.event.listen('app:open-files', () => { drainOpenFiles(); })
+        .catch((e) => console.warn('文件转发事件订阅失败', e));
+    }
+  }
+
+  /** Rust 侧把路径压在队列里，这里循环取空——事件和取队列谁先谁后都不会丢 */
+  async function drainOpenFiles() {
+    if (openQueueBusy) { openQueueAgain = true; return; }
+    openQueueBusy = true;
+    try {
+      for (;;) {
+        openQueueAgain = false;
+        const list = await MD.fsx.pendingOpenFiles();
+        if (!list.length) break;
+        await openPathsAsTabs(list);
+      }
+    } catch (e) {
+      console.warn('处理转发文件失败', e);
+    } finally {
+      openQueueBusy = false;
+    }
+    // 补上「取空判断之后、标志释放之前」到达的那一次
+    if (openQueueAgain) { openQueueAgain = false; drainOpenFiles(); }
+  }
+
+  async function openPathsAsTabs(paths) {
+    const ids = [];
+    for (const p of paths) {
+      if (U.isMarkdown(p) || U.ext(p) === 'txt') {
+        const d = await MD.actions.openFile(p);
+        if (d && d.id) ids.push(d.id);
+      } else if (MD.actions.isConvertible(p)) {
+        const d = await MD.actions.importFile(p);   // PDF/Word 等：转成 .md 再开标签
+        if (d && d.id) ids.push(d.id);
+      } else {
+        MD.toast('不支持的文件类型：' + U.baseName(p));
+      }
+    }
+    // 多选打开时停在第一个：用户双击的那个文件才是他真正想看的目标
+    if (ids.length > 1) MD.docs.activate(ids[0]);
+  }
+
   /* ══════════ 关闭流程 ══════════ */
   // Rust 侧拦截 CloseRequested 后广播 app:close-requested，前端只做决策。
   // 绝不再用 window.onCloseRequested：那条链路要求前端调用 window.destroy()，
@@ -806,14 +857,15 @@
     startExternalWatch();
 
     bindCloseFlow();
+    bindOpenFiles();
 
     // 启动文件（文件关联双击打开）
+    // 与「一次转发多个路径」走同一条批处理：多选后回车时全部各开一个标签，
+    // 并且停在第一个（用户最先选中的那个），不会因为最后一个后打开就抢占焦点。
     const startup = await MD.fsx.startupFile();
-    if (startup && U.isMarkdown(startup)) {
-      await MD.actions.openFile(startup);
-    } else if (startup) {
-      // 非 Markdown 的启动参数不再静默忽略：转成 .md 后打开
-      await MD.actions.importFile(startup);
+    if (startup) {
+      const extra = await MD.fsx.pendingOpenFiles();
+      await openPathsAsTabs([startup, ...extra]);
     } else {
       // 恢复上次文件夹
       if (s.lastFolder) {
@@ -829,6 +881,9 @@
       }
       if (!restored) renderNow();
     }
+
+    // 启动期间另一个实例可能已经转发过文件（那时监听还没注册）：把队列取空
+    await drainOpenFiles();
 
     // 一个文档都没有时才显示欢迎页
     if (MD.docs.count() === 0) {

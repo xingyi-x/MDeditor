@@ -131,6 +131,13 @@
     async startupFile() {
       try { return await invoke('get_startup_file', {}); } catch (e) { return null; }
     },
+    /** 另一个实例转发过来的待打开文件（取走后队列清空，不会重复消费） */
+    async pendingOpenFiles() {
+      try {
+        const r = await invoke('take_pending_open', {});
+        return Array.isArray(r) ? r : [];
+      } catch (e) { return []; }
+    },
     /** --pdf-out 目标路径（自动化导出用，普通启动为 null） */
     async pdfTarget() {
       try { return await invoke('get_pdf_target', {}); } catch (e) { return null; }
@@ -345,6 +352,7 @@
       return '/';
     },
     async startupFile() { return null; },
+    async pendingOpenFiles() { return []; },
     async pdfTarget() { return null; },
     async quit() { window.close(); },
     async appVersion() { return ''; },

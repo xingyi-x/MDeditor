@@ -38,6 +38,12 @@ struct AppState {
     startup_file: Mutex<Option<String>>,
     /// --pdf-out <路径>：启动后自动把当前文档导出成 PDF 再退出（自测 / 批处理用）
     pdf_out: Mutex<Option<String>>,
+    /// 第二个实例转发过来的待打开文件。
+    ///
+    /// 必须排队而不是「只发一次事件」：管道服务端在窗口创建时就已经开始监听，
+    /// 而前端的 `listen` 要等页面脚本执行到才注册，中间这段时间到达的路径会直接丢。
+    /// 前端无论在启动期还是运行期，都只调一次 take_pending_open 把队列取空。
+    pending_open: Mutex<Vec<String>>,
 }
 
 /// 关闭流程的裁决权放在 Rust 侧。
@@ -681,6 +687,19 @@ fn get_pdf_target(state: tauri::State<AppState>) -> Option<String> {
     state.pdf_out.lock().unwrap().clone()
 }
 
+/// 取走「另一个实例转发过来的待打开文件」。
+///
+/// 用「取走」而不是「查询」：前端可能在启动期调用一次、事件到达时再调用一次，
+/// 必须保证同一个路径不会被打开两遍（重复打开虽然会去重到同一个标签，
+/// 但会让活动标签顺序变得不可预期）。
+#[tauri::command]
+fn take_pending_open(state: tauri::State<AppState>) -> Vec<String> {
+    match state.pending_open.lock() {
+        Ok(mut q) => std::mem::take(&mut *q),
+        Err(_) => Vec::new(),
+    }
+}
+
 #[tauri::command]
 fn quit_app(app: tauri::AppHandle, code: Option<i32>) {
     // 标记为「已允许关闭」再退出：即使 app.exit 之后还有一次 CloseRequested，
@@ -1011,19 +1030,30 @@ fn open_default_apps_settings() -> Result<(), String> {
     }
 }
 
+/// 单实例 / 转发管道的名字后缀。
+///
+/// 调试构建加 `.dev`：否则 `cargo run` 会和已安装的正式版抢同一把锁，
+/// 开发时不得不先关掉正在用的窗口。正式版后缀为空，行为不变。
+#[cfg(windows)]
+const INSTANCE_SUFFIX: &str = if cfg!(debug_assertions) { ".dev" } else { "" };
+
 /// 单实例：Windows 命名互斥体。句柄随进程一直持有，第二个实例拿到
-/// ERROR_ALREADY_EXISTS 后提示用户并直接退出，避免两个窗口同时写同一文档。
+/// ERROR_ALREADY_EXISTS 后把命令行里的文件转发给已有窗口（见 `ipc`），
+/// 由已有窗口新开标签页，然后自身静默退出。
+///
+/// 为什么不再弹「已在运行」提示：多标签上线后，双击另一个 .md 却只得到一句
+/// 提示，用户还得自己去已有窗口里再打开一次，等于文件关联失效。
+///
 /// CLI 转换在 main() 开头就已经 exit，不受影响；--pdf-out 自动化导出显式跳过。
 #[cfg(windows)]
 fn acquire_single_instance() -> bool {
     use windows::core::PCWSTR;
     use windows::Win32::Foundation::{GetLastError, ERROR_ALREADY_EXISTS};
     use windows::Win32::System::Threading::CreateMutexW;
-    use windows::Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_ICONINFORMATION, MB_OK};
 
-    let name: Vec<u16> = "Local\\MDeditor.SingleInstance\0".encode_utf16().collect();
-    let title: Vec<u16> = "MDeditor\0".encode_utf16().collect();
-    let text: Vec<u16> = "MDeditor 已在运行，请切换到已有窗口继续编辑。\0".encode_utf16().collect();
+    let name: Vec<u16> = format!("Local\\MDeditor.SingleInstance{INSTANCE_SUFFIX}\0")
+        .encode_utf16()
+        .collect();
     unsafe {
         match CreateMutexW(None, true, PCWSTR(name.as_ptr())) {
             Ok(handle) => {
@@ -1031,16 +1061,7 @@ fn acquire_single_instance() -> bool {
                 let exists = GetLastError() == ERROR_ALREADY_EXISTS;
                 // HANDLE 没有 Drop 实现，句柄会一直保持到进程退出；此处不做任何关闭动作
                 let _ = handle;
-                if !exists {
-                    return true;
-                }
-                let _ = MessageBoxW(
-                    None,
-                    PCWSTR(text.as_ptr()),
-                    PCWSTR(title.as_ptr()),
-                    MB_OK | MB_ICONINFORMATION,
-                );
-                false
+                !exists
             }
             // 互斥体创建失败时放行，避免把用户彻底锁在应用外面
             Err(_) => true,
@@ -1051,6 +1072,190 @@ fn acquire_single_instance() -> bool {
 #[cfg(not(windows))]
 fn acquire_single_instance() -> bool {
     true
+}
+
+/// 单实例之间的文件转发：命名管道（`\\.\pipe\MDeditor.OpenFile.v1`）。
+///
+/// 不用 WM_COPYDATA：那需要按窗口标题查找已有窗口，而 MDeditor 的标题是
+/// 「MDeditor — 文件名 ●」动态变化的，查找不可靠；也不必为此另起消息循环。
+/// 管道是阻塞式字节流，服务端在读线程里等，客户端写完即走，语义最直接。
+#[cfg(windows)]
+mod ipc {
+    use std::path::Path;
+    use std::time::{Duration, Instant};
+
+    use tauri::{Emitter, Manager};
+    use windows::core::PCWSTR;
+    use windows::Win32::Foundation::{CloseHandle, GENERIC_WRITE};
+    use windows::Win32::Storage::FileSystem::{
+        CreateFileW, ReadFile, WriteFile, FILE_FLAGS_AND_ATTRIBUTES, FILE_SHARE_MODE, OPEN_EXISTING,
+        PIPE_ACCESS_INBOUND,
+    };
+    use windows::Win32::System::Pipes::{
+        ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, PIPE_TYPE_BYTE,
+        NMPWAIT_USE_DEFAULT_WAIT,
+    };
+    use windows::Win32::UI::WindowsAndMessaging::{
+        AllowSetForegroundWindow, MessageBoxW, ASFW_ANY, MB_ICONINFORMATION, MB_OK,
+    };
+
+    const PIPE_NAME_BASE: &str = "\\\\.\\pipe\\MDeditor.OpenFile.v1";
+    /// 一次转发最多读这么多字节：正常只有几个路径，超过就当异常客户端截断
+    const MAX_PAYLOAD: usize = 1 << 20;
+
+    /// 与互斥体同后缀：调试构建的管道和正式版互不干扰
+    fn pipe_name() -> String {
+        format!("{PIPE_NAME_BASE}{}", super::INSTANCE_SUFFIX)
+    }
+
+    fn wide(s: &str) -> Vec<u16> {
+        s.encode_utf16().chain(std::iter::once(0)).collect()
+    }
+
+    /// 在后台线程里循环「建管道 → 等连接 → 读完 → 交给前端」。
+    ///
+    /// 必须一直接着建：客户端读完就关，管道实例随之失效，下一次双击要能立刻连上。
+    pub fn spawn_server(app: tauri::AppHandle) {
+        std::thread::spawn(move || {
+            let name = {
+                let s = pipe_name();
+                wide(&s)
+            };
+            loop {
+                let pipe = unsafe {
+                    CreateNamedPipeW(
+                        PCWSTR(name.as_ptr()),
+                        PIPE_ACCESS_INBOUND,
+                        PIPE_TYPE_BYTE,
+                        1,
+                        0,
+                        64 * 1024,
+                        NMPWAIT_USE_DEFAULT_WAIT,
+                        None,
+                    )
+                };
+                if pipe.is_invalid() {
+                    // 建不出来（句柄耗尽等）就退避重试，绝不 panic 拖垮进程
+                    std::thread::sleep(Duration::from_millis(500));
+                    continue;
+                }
+                // 阻塞等客户端。返回 ERROR_PIPE_CONNECTED 表示客户端在
+                // ConnectNamedPipe 之前就连上了，同样可以直接读，不算失败。
+                let _ = unsafe { ConnectNamedPipe(pipe, None) };
+                let mut buf: Vec<u8> = Vec::new();
+                let mut chunk = [0u8; 8192];
+                loop {
+                    let mut read = 0u32;
+                    if unsafe { ReadFile(pipe, Some(&mut chunk[..]), Some(&mut read), None) }.is_err()
+                        || read == 0
+                    {
+                        break; // 客户端写完后关闭 → ERROR_BROKEN_PIPE / 读到 0
+                    }
+                    buf.extend_from_slice(&chunk[..read as usize]);
+                    if buf.len() >= MAX_PAYLOAD {
+                        break;
+                    }
+                }
+                unsafe {
+                    let _ = DisconnectNamedPipe(pipe);
+                    let _ = CloseHandle(pipe);
+                }
+                deliver(&app, &buf);
+            }
+        });
+    }
+
+    fn deliver(app: &tauri::AppHandle, buf: &[u8]) {
+        let list: Vec<String> = String::from_utf8_lossy(buf)
+            .split('\n')
+            .map(|s| s.trim_end_matches('\r').to_string())
+            .filter(|s| !s.is_empty() && Path::new(s).exists())
+            .collect();
+
+        // 先进队列再发事件：前端可能还没注册监听（启动期），事件丢了也还有队列兜底
+        if let Some(state) = app.try_state::<super::AppState>() {
+            if let Ok(mut q) = state.pending_open.lock() {
+                q.extend(list);
+            }
+        }
+        // 已有窗口可能被挡住或最小化，双击文件后必须能看到它
+        if let Some(w) = app.get_webview_window("main") {
+            let _ = w.unminimize();
+            let _ = w.show();
+            let _ = w.set_focus();
+        }
+        let _ = app.emit("app:open-files", ());
+    }
+
+    /// 把本次启动要打开的文件交给已有实例。成功返回 true，调用方应静默退出。
+    ///
+    /// 带重试：已有实例刚启动时互斥体已存在、管道可能还没建好，
+    /// 不重试就会出现「双击后什么都不发生」。
+    pub fn forward(paths: &[String]) -> bool {
+        // 把「前台权限」让给已有窗口：它本来不是前台进程，直接 set_focus 会被
+        // Windows 的前台锁拦住，用户只会看到任务栏图标闪一下。
+        // 本进程是用户刚双击起来的，持有这个权限，可以转授。
+        unsafe {
+            let _ = AllowSetForegroundWindow(ASFW_ANY);
+        }
+        let payload = paths.join("\n");
+        let name = {
+            let s = pipe_name();
+            wide(&s)
+        };
+        let deadline = Instant::now() + Duration::from_millis(1500);
+        loop {
+            let opened = unsafe {
+                CreateFileW(
+                    PCWSTR(name.as_ptr()),
+                    GENERIC_WRITE.0,
+                    FILE_SHARE_MODE(0),
+                    None,
+                    OPEN_EXISTING,
+                    FILE_FLAGS_AND_ATTRIBUTES(0),
+                    None,
+                )
+            };
+            if let Ok(h) = opened {
+                let mut written = 0u32;
+                let sent = unsafe {
+                    WriteFile(h, Some(payload.as_bytes()), Some(&mut written), None).is_ok()
+                        && written as usize == payload.len()
+                };
+                unsafe {
+                    let _ = CloseHandle(h); // 关闭即 EOF，服务端随即结束读取
+                }
+                return sent;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(40));
+        }
+    }
+
+    /// 转发失败时的兜底提示：宁可多说一句，也不要让用户以为文件打开失败是丢文件
+    pub fn show_already_running() {
+        let title = wide("MDeditor");
+        let text = wide("MDeditor 已在运行，但无法与已有窗口通信。\n请切换到已有窗口，或结束 MDeditor 进程后重试。");
+        unsafe {
+            let _ = MessageBoxW(
+                None,
+                PCWSTR(text.as_ptr()),
+                PCWSTR(title.as_ptr()),
+                MB_OK | MB_ICONINFORMATION,
+            );
+        }
+    }
+}
+
+#[cfg(not(windows))]
+mod ipc {
+    pub fn spawn_server(_app: tauri::AppHandle) {}
+    pub fn forward(_paths: &[String]) -> bool {
+        false
+    }
+    pub fn show_already_running() {}
 }
 
 fn main() {
@@ -1077,20 +1282,31 @@ fn main() {
 
     // `mdeditor.exe --pdf-out out.pdf in.md` 里的 out.pdf 也是个存在的路径，
     // 但它是**输出**而不是要打开的文档，必须排除，否则启动后先打开一个 PDF。
-    let startup_file = args
+    // 收集全部而不是只取第一个：资源管理器里多选后回车会一次传进多个路径，
+    // 已有实例运行时这些路径都要各开一个标签。
+    let open_paths: Vec<String> = args
         .iter()
-        .find(|a| {
+        .filter(|a| {
             !a.starts_with('-')
                 && pdf_value.as_deref() != Some(a.as_str())
                 && Path::new(a).is_file()
         })
-        .cloned();
+        .cloned()
+        .collect();
+    let startup_file = open_paths.first().cloned();
+    // 其余路径交给「待打开」队列，由前端在启动末尾统一取走（各开一个标签）
+    let extra_paths: Vec<String> = open_paths.iter().skip(1).cloned().collect();
 
     // --pdf-out 是无界面自动化导出，必须允许与常驻 GUI 实例并存
     let automation = args
         .iter()
         .any(|a| a == "--pdf-out" || a.starts_with("--pdf-out="));
     if !automation && !acquire_single_instance() {
+        // 已有实例在跑：把文件转发过去让它新开标签，然后本进程静默退出。
+        // 转发失败（已有实例卡死/管道不可用）才提示，避免用户以为双击没反应。
+        if !ipc::forward(&open_paths) {
+            ipc::show_already_running();
+        }
         return;
     }
 
@@ -1099,6 +1315,9 @@ fn main() {
         .manage(AppState {
             startup_file: Mutex::new(startup_file),
             pdf_out: Mutex::new(pdf_out),
+            // 首实例一次带进多个路径时，除第一个之外都走「待打开」队列，
+            // 否则资源管理器里多选后回车只会打开第一个文件
+            pending_open: Mutex::new(extra_paths),
         })
         .manage(CloseGuard::default())
         // 关闭裁决：默认拦下并交给前端询问；前端答完调用 quit_app 才真正退出。
@@ -1130,12 +1349,17 @@ fn main() {
             api.prevent_close();
             let _ = window.emit("app:close-requested", ());
         })
-        .setup(|_app| {
+        .setup(move |_app| {
             #[cfg(debug_assertions)]
             {
                 if let Some(w) = _app.get_webview_window("main") {
                     let _ = w.open_devtools();
                 }
+            }
+            // 监听「第二个实例转发过来的文件」。--pdf-out 自动化导出不该抢文件，
+            // 它自己也不接受转发（互斥体对它来说是跳过的）。
+            if !automation {
+                ipc::spawn_server(_app.handle().clone());
             }
             Ok(())
         })
@@ -1159,6 +1383,7 @@ fn main() {
             open_with_default_app,
             get_startup_file,
             get_pdf_target,
+            take_pending_open,
             quit_app,
             convert_to_md,
             can_convert,

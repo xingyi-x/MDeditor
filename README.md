@@ -8,11 +8,11 @@
 
 | 文件 | 说明 |
 | --- | --- |
-| `MDeditor-v1.6.0-setup.exe` | **安装版（推荐）**：含 `.md` 文件关联、开始菜单快捷方式，可在「应用和功能」中卸载 |
+| `MDeditor-v1.6.1-setup.exe` | **安装版（推荐）**：含 `.md` 文件关联、开始菜单快捷方式，可在「应用和功能」中卸载 |
 | `MDeditor.exe` | **绿色版**：单文件免安装，双击即用（前端资源已内嵌），同时作为命令行入口 |
 | `mdconv.bat` | 命令行转换包装脚本，与 `MDeditor.exe` 放同一目录即可使用 |
 
-> 本机构建产出的安装包名为 `MDeditor-v1.6.0-安装包.exe`；上传 Releases 时 GitHub 会剔除文件名中的非 ASCII 字符，故下载名为 `MDeditor-v1.6.0-setup.exe`，两者内容一致。
+> 本机构建产出的安装包名为 `MDeditor-v1.6.1-安装包.exe`；上传 Releases 时 GitHub 会剔除文件名中的非 ASCII 字符，故下载名为 `MDeditor-v1.6.1-setup.exe`，两者内容一致。
 
 环境要求：Windows 10/11 x64 + WebView2 Runtime（Windows 11 已内置；Win10 若缺失需[单独安装](https://developer.microsoft.com/microsoft-edge/webview2/)）。
 
@@ -140,7 +140,7 @@ MDeditor/
 ├── .github/workflows/  CI（Rust 编译与单测、前端 JS 语法检查）
 ├── dist/               打包产物
 │   ├── MDeditor.exe              绿色版 / 命令行入口（仓库内附带）
-│   ├── MDeditor-v1.6.0-安装包.exe    NSIS 安装包（仅本机构建产物，Releases 下载名为 setup）
+│   ├── MDeditor-v1.6.1-安装包.exe    NSIS 安装包（仅本机构建产物，Releases 下载名为 setup）
 │   └── mdconv.bat                命令行包装脚本
 ├── _toolchain/          Rust 工具链与探针脚本（仅本机自用，可选，gitignore）
 ├── _backup/             版本快照（本地备份，gitignore）
@@ -196,6 +196,15 @@ cargo tauri build
 | Esc                            | 退出阅读模式 / 关闭面板            |
 
 ## 更新日志
+
+### v1.6.1（双击文件交给已有窗口）
+
+- **修复：程序已打开一个文件时，双击另一个 `.md` 只会弹「已在运行」**，文件并不会打开。
+  现在第二个进程会把文件路径通过本地命名管道交给已有窗口，由它**新开一个标签**，然后自身静默退出。
+- 已有窗口会被带到前台（最小化则还原），不需要用户自己去任务栏里找。
+- 资源管理器中多选后回车 / 一次拖入多个文件的场景同样生效：路径一起转发，各开一个标签。
+- 转发失败（已有实例卡死）才回退到原来的提示框，不会出现「双击毫无反应」。
+- 转发只走本机命名管道 `\\.\pipe\MDeditor.OpenFile.v1`，不涉及任何网络通信。
 
 ### v1.6.0（多标签页）
 

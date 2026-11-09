@@ -97,9 +97,10 @@
       } else {
         MD.toast('已转换：' + U.baseName(outPath));
       }
-      await openFile(outPath, { reload: true });
+      return await openFile(outPath, { reload: true });   // 返回文档记录，供调用方定位标签
     } catch (e) {
       MD.toast('转换失败：' + (e && e.message ? e.message : e));
+      return null;
     }
   }
 
